@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+garmin_venv/
+
+# Large data files
+data/fit_all_sessions.json
+data/garmin_running_data.json
+
+# Credentials & secrets
+*.env
+.env*
+garmin_credentials*
+
+# OS
+.DS_Store
+
+# Logs
+*.log

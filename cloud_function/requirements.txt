@@ -1,0 +1,4 @@
+functions-framework==3.*
+garminconnect==0.2.40
+garth==0.6.3
+google-cloud-secret-manager==2.*
