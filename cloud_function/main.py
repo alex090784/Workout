@@ -15,10 +15,11 @@ import os
 import re
 import smtplib
 import random
+import time
 import functions_framework
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from garminconnect import Garmin
 import garth
 from google.cloud import secretmanager
@@ -53,7 +54,41 @@ def update_secret(secret_id, value):
     client.add_secret_version(request={"parent": parent, "payload": {"data": value}})
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
+def _refresh_with_backoff(gc, max_attempts=3):
+    """
+    Pre-check token expiry and force a refresh before returning the client.
+    Uses exponential backoff (10/20/40s) to handle Garmin 429 rate limits.
+    Raises RuntimeError with '429' in the message if all attempts fail on rate-limit.
+    """
+    tok = gc.oauth2_token
+    now = datetime.now(timezone.utc)
+    exp = datetime.fromtimestamp(tok.expires_at, tz=timezone.utc)
+    if not tok.expired:
+        print(f"Access token valid until {exp} — no exchange needed.")
+        return
+
+    print(f"Access token expired at {exp}. Attempting refresh with backoff...")
+    delay = 10
+    for attempt in range(1, max_attempts + 1):
+        try:
+            gc.connectapi("/userprofile-service/userprofile/personal-information")
+            print(f"Token refreshed successfully on attempt {attempt}.")
+            return
+        except Exception as e:
+            err = str(e)
+            if "429" in err:
+                if attempt < max_attempts:
+                    print(f"429 rate-limit on attempt {attempt}. Waiting {delay}s...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    raise RuntimeError(f"429: Garmin rate-limit after {max_attempts} attempts. Try again in ~1hr.")
+            else:
+                raise  # non-429 errors propagate immediately
+
+
 def load_garmin_client():
+    """Load garth tokens from Secret Manager into /tmp, pre-check expiry, return authenticated client."""
     os.makedirs(TOKEN_DIR, exist_ok=True)
     oauth2 = get_secret("garmin-oauth2-token")
     oauth1 = get_secret("garmin-oauth1-token")
@@ -64,14 +99,32 @@ def load_garmin_client():
     garth.resume(TOKEN_DIR)
     client = Garmin()
     client.garth = garth.client
+
+    # Pre-check and refresh before handing client to callers — prevents silent 429s
+    # inside get_activities() where the error is harder to catch and classify.
+    _refresh_with_backoff(garth.client)
+
     return client
 
+
 def save_tokens_if_refreshed():
+    """Save refreshed garth tokens back to Secret Manager, only if the token changed."""
     try:
-        garth.save(TOKEN_DIR)
+        # Read what's currently in SM to compare
+        current_sm = get_secret("garmin-oauth2-token")
+        garth.save(TOKEN_DIR)  # write current in-memory tokens to /tmp
         with open(f"{TOKEN_DIR}/oauth2_token.json") as f:
-            update_secret("garmin-oauth2-token", f.read())
-        print("Tokens saved to Secret Manager")
+            new_token = f.read()
+
+        # Skip writing a new SM version if the access token is identical
+        current_at = json.loads(current_sm).get("access_token", "")
+        new_at = json.loads(new_token).get("access_token", "")
+        if current_at == new_at:
+            print("Token unchanged — skipping Secret Manager write.")
+            return
+
+        update_secret("garmin-oauth2-token", new_token)
+        print("Tokens saved to Secret Manager (new version created).")
     except Exception as e:
         print(f"Token save warning: {e}")
 
@@ -988,5 +1041,9 @@ def garmin_daily_feedback(request):
         return ("OK", 200)
 
     except Exception as e:
-        print(f"Fatal error: {e}")
-        return (f"Error: {e}", 500)
+        err = str(e)
+        print(f"Fatal error: {err}")
+        if "429" in err:
+            # Return 429 so Cloud Scheduler knows to back off and retry later
+            return (f"Rate-limited by Garmin: {err}", 429)
+        return (f"Error: {err}", 500)
