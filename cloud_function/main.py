@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Daily Garmin Connect session analyser — GCP Cloud Function version
-Pulls yesterday's activity and generates professional trail running coaching feedback
+Plan-aware training feedback for the Otter African Trail Run 2026.
+
+Pulls yesterday's activity, compares against the 13-week training plan in BQ,
+and generates coaching feedback with effort-intensity verdicts.
+
 Inspired by: Jason Koop (ultrarunning), Joe Friel (triathlete's bible),
              Steve Magness (science of running), Maffetone (aerobic base)
 """
@@ -14,16 +18,25 @@ import random
 import functions_framework
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from garminconnect import Garmin
 import garth
 from google.cloud import secretmanager
+from google.cloud import bigquery
 
 # ── Config ───────────────────────────────────────────────────────────────────
-PROJECT_ID   = "abm2020"
+PROJECT_ID   = "alexct-training"
+BQ_PROJECT   = "alexct-training"
+BQ_DATASET   = "garmin_training"
+BQ_TABLE     = f"{BQ_PROJECT}.{BQ_DATASET}.training_sessions"
+BQ_PLAN      = f"{BQ_PROJECT}.{BQ_DATASET}.training_plan"
 TOKEN_DIR    = "/tmp/.garth"
 LT_HR        = 176
 MAX_HR       = 198
+
+# Race date: Otter Day 2 main race
+RACE_DATE    = date(2026, 9, 24)
+PLAN_START   = date(2026, 6, 29)
 
 # ── Secret Manager ────────────────────────────────────────────────────────────
 def get_secret(secret_id):
@@ -33,7 +46,6 @@ def get_secret(secret_id):
     return response.payload.data.decode("utf-8")
 
 def update_secret(secret_id, value):
-    """Update a secret with a new version."""
     client = secretmanager.SecretManagerServiceClient()
     parent = f"projects/{PROJECT_ID}/secrets/{secret_id}"
     if isinstance(value, str):
@@ -42,30 +54,24 @@ def update_secret(secret_id, value):
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 def load_garmin_client():
-    """Load garth tokens from Secret Manager into /tmp, return authenticated client."""
     os.makedirs(TOKEN_DIR, exist_ok=True)
-
     oauth2 = get_secret("garmin-oauth2-token")
     oauth1 = get_secret("garmin-oauth1-token")
-
     with open(f"{TOKEN_DIR}/oauth2_token.json", "w") as f:
         f.write(oauth2)
     with open(f"{TOKEN_DIR}/oauth1_token.json", "w") as f:
         f.write(oauth1)
-
-    # garth 0.6.x: resume() loads existing tokens without triggering a new exchange
     garth.resume(TOKEN_DIR)
     client = Garmin()
     client.garth = garth.client
     return client
 
 def save_tokens_if_refreshed():
-    """Save refreshed garth tokens back to Secret Manager."""
     try:
-        garth.save(TOKEN_DIR)  # write refreshed tokens to /tmp
+        garth.save(TOKEN_DIR)
         with open(f"{TOKEN_DIR}/oauth2_token.json") as f:
             update_secret("garmin-oauth2-token", f.read())
-        print("✅ Tokens saved to Secret Manager")
+        print("Tokens saved to Secret Manager")
     except Exception as e:
         print(f"Token save warning: {e}")
 
@@ -74,22 +80,20 @@ def send_email(subject, markdown_body):
     try:
         gmail_user = get_secret("garmin-gmail-user")
         app_password = get_secret("garmin-gmail-app-password")
-        recipient = gmail_user  # sending to self
-
+        recipient = gmail_user
         html = markdown_to_html(markdown_body)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"]    = f"Garmin Coach <{gmail_user}>"
+        msg["From"]    = f"Coach Aria <{gmail_user}>"
         msg["To"]      = recipient
         msg.attach(MIMEText(markdown_body, "plain"))
         msg.attach(MIMEText(html, "html"))
-
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_user, app_password)
             smtp.sendmail(gmail_user, recipient, msg.as_string())
-        print("✅ Email sent successfully")
+        print("Email sent successfully")
     except Exception as e:
-        print(f"⚠️  Email failed: {e}")
+        print(f"Email failed: {e}")
 
 def markdown_to_html(md):
     lines = md.split("\n")
@@ -108,23 +112,31 @@ def markdown_to_html(md):
             html_lines.append(f'<p style="font-weight:700;margin:8px 0">{line[2:-2]}</p>')
         elif line.startswith("- "):
             html_lines.append(f'<li style="margin:4px 0;line-height:1.5">{line[2:]}</li>')
-        elif line.startswith("✅"):
-            html_lines.append(f'<p style="color:#2d6a4f;margin:6px 0">{line}</p>')
-        elif line.startswith("⚠️"):
-            html_lines.append(f'<p style="color:#e07c24;margin:6px 0">{line}</p>')
-        elif line.startswith("🔴"):
-            html_lines.append(f'<p style="color:#c62828;margin:6px 0">{line}</p>')
-        elif line.startswith("🔵") or line.startswith("🟡") or line.startswith("🟢"):
-            html_lines.append(f'<p style="font-weight:600;margin:8px 0">{line}</p>')
-        elif line.startswith("*") and line.endswith("*") and not line.startswith("**"):
-            html_lines.append(f'<p style="font-style:italic;color:#555;margin:4px 0">{line[1:-1]}</p>')
+        elif line.startswith("EFFORT VERDICT:"):
+            # Special styling for effort verdicts
+            if "NAILED IT" in line:
+                html_lines.append(f'<p style="color:#2d6a4f;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#e8f5e9;border-radius:6px">{line}</p>')
+            elif "TOO EASY" in line or "NOT HARD ENOUGH" in line:
+                html_lines.append(f'<p style="color:#e65100;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#fff3e0;border-radius:6px">{line}</p>')
+            elif "TOO HARD" in line:
+                html_lines.append(f'<p style="color:#c62828;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#ffebee;border-radius:6px">{line}</p>')
+            else:
+                html_lines.append(f'<p style="font-weight:700;margin:10px 0;padding:8px;background:#f5f5f5;border-radius:6px">{line}</p>')
+        elif line.startswith("PLANNED:") or line.startswith("DONE:"):
+            html_lines.append(f'<p style="font-family:monospace;margin:4px 0;line-height:1.6;background:#f8f9fa;padding:4px 8px;border-radius:4px">{line}</p>')
+        elif any(line.startswith(e) for e in ["Status:", "Target:", "Done:"]):
+            line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
+            html_lines.append(f'<p style="margin:4px 0;line-height:1.6">{line}</p>')
         elif line.startswith("---"):
             html_lines.append('<hr style="border:none;border-top:1px solid #eee;margin:16px 0">')
         elif line.strip() == "":
             html_lines.append("<br>")
         else:
             line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
-            html_lines.append(f'<p style="margin:4px 0;line-height:1.6">{line}</p>')
+            if line.startswith("*") and line.endswith("*") and not line.startswith("**"):
+                html_lines.append(f'<p style="font-style:italic;color:#555;margin:4px 0">{line[1:-1]}</p>')
+            else:
+                html_lines.append(f'<p style="margin:4px 0;line-height:1.6">{line}</p>')
     html_lines.append("</div></body></html>")
     return "\n".join(html_lines)
 
@@ -135,6 +147,22 @@ ZONES = {
     "Z3": (158, 167),
     "Z4": (167, 178),
     "Z5": (178, 999),
+}
+
+# Expected HR ranges per session type for effort comparison
+SESSION_HR_TARGETS = {
+    "easy_trail":    {"min": 120, "max": 150, "zone": "Z1-Z2"},
+    "easy_road":     {"min": 120, "max": 150, "zone": "Z1-Z2"},
+    "long_run":      {"min": 135, "max": 160, "zone": "Z2"},
+    "tempo":         {"min": 158, "max": 170, "zone": "Z3-Z4"},
+    "threshold":     {"min": 167, "max": 178, "zone": "Z4"},
+    "hill_repeats":  {"min": 160, "max": 178, "zone": "Z3-Z4"},
+    "vo2max":        {"min": 175, "max": 192, "zone": "Z5"},
+    "prologue_sim":  {"min": 170, "max": 188, "zone": "Z4-Z5"},
+    "race_sim":      {"min": 145, "max": 168, "zone": "Z2-Z3"},
+    "sharpener":     {"min": 165, "max": 180, "zone": "Z4-Z5"},
+    "activation":    {"min": 120, "max": 145, "zone": "Z1"},
+    "race":          {"min": 155, "max": 185, "zone": "Z2-Z5"},
 }
 
 def hr_zone(hr):
@@ -152,6 +180,426 @@ def fmt_duration(minutes):
     m = int(minutes % 60)
     return f"{h}h{m:02d}m" if h else f"{m}min"
 
+# ── BigQuery ──────────────────────────────────────────────────────────────────
+bq_client = None
+
+def get_bq_client():
+    global bq_client
+    if bq_client is None:
+        bq_client = bigquery.Client(project=BQ_PROJECT)
+    return bq_client
+
+def save_session_to_bq(a):
+    """Write a Garmin activity to BQ. Skips if activity_id already exists."""
+    client = get_bq_client()
+    activity_id = a.get("activityId")
+    if not activity_id:
+        return
+
+    q = f"SELECT 1 FROM `{BQ_TABLE}` WHERE activity_id = {activity_id} LIMIT 1"
+    result = list(client.query(q).result())
+    if result:
+        print(f"Activity {activity_id} already in BQ, skipping")
+        return
+
+    dist_km = round((a.get("distance") or 0) / 1000, 2)
+    dur_min = round((a.get("duration") or 0) / 60, 1)
+    elev_m = round(a.get("elevationGain") or 0, 0)
+    avg_hr = a.get("averageHR")
+    max_hr_val = a.get("maxHR")
+    avg_pace = round((a.get("duration") or 0) / 60 / ((a.get("distance") or 1) / 1000), 2) if a.get("distance") else None
+    m_per_km = round(elev_m / dist_km, 1) if dist_km else 0
+    zone = hr_zone(avg_hr) if avg_hr else None
+    speed_kmh = 60 / avg_pace if avg_pace and avg_pace > 0 else None
+    efficiency = round(avg_hr / speed_kmh, 2) if avg_hr and speed_kmh else None
+
+    row = {
+        "activity_id": activity_id,
+        "activity_name": a.get("activityName", "Unnamed"),
+        "activity_type": a.get("activityType", {}).get("typeKey", "unknown"),
+        "start_time": a.get("startTimeLocal", "")[:19].replace("T", " "),
+        "distance_km": dist_km,
+        "duration_min": dur_min,
+        "elevation_gain_m": elev_m,
+        "avg_hr": avg_hr,
+        "max_hr": max_hr_val,
+        "avg_pace_min_km": avg_pace,
+        "aerobic_training_effect": a.get("aerobicTrainingEffect"),
+        "vo2max": a.get("vO2MaxValue"),
+        "calories": a.get("calories"),
+        "elevation_density_m_km": m_per_km,
+        "hr_zone": zone,
+        "efficiency_index": efficiency,
+        "inserted_at": datetime.utcnow().isoformat(),
+    }
+
+    errors = client.insert_rows_json(BQ_TABLE, [row])
+    if errors:
+        print(f"BQ insert error: {errors}")
+    else:
+        print(f"Saved activity {activity_id} to BQ")
+
+# ── Plan queries ─────────────────────────────────────────────────────────────
+
+def get_todays_plan(today_date):
+    """Query BQ for today's planned session. Returns dict or None."""
+    client = get_bq_client()
+    q = f"""
+    SELECT plan_date, week_number, phase, day_of_week, session_type, session_name,
+           target_km, target_vert_m, target_duration_min, target_hr_zone,
+           target_hr_max, target_rpe, week_target_km, week_target_vert,
+           description, effort_description, is_key_session
+    FROM `{BQ_PLAN}`
+    WHERE plan_date = '{today_date.isoformat()}'
+    LIMIT 1
+    """
+    rows = list(client.query(q).result())
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "plan_date": r.plan_date,
+        "week_number": r.week_number,
+        "phase": r.phase,
+        "day_of_week": r.day_of_week,
+        "session_type": r.session_type,
+        "session_name": r.session_name,
+        "target_km": r.target_km,
+        "target_vert_m": r.target_vert_m,
+        "target_duration_min": r.target_duration_min,
+        "target_hr_zone": r.target_hr_zone,
+        "target_hr_max": r.target_hr_max,
+        "target_rpe": r.target_rpe,
+        "week_target_km": r.week_target_km,
+        "week_target_vert": r.week_target_vert,
+        "description": r.description,
+        "effort_description": r.effort_description,
+        "is_key_session": r.is_key_session,
+    }
+
+
+def get_tomorrows_plan(today_date):
+    """Query BQ for tomorrow's planned session."""
+    tomorrow = today_date + timedelta(days=1)
+    return get_todays_plan(tomorrow)
+
+
+def get_week_progress(today_date):
+    """Compare actual sessions this week vs planned targets.
+    Week runs Mon-Sun, matching the plan's day_of_week layout."""
+    client = get_bq_client()
+
+    # Find the plan week that contains today
+    q_plan = f"""
+    SELECT week_number, phase, week_target_km, week_target_vert,
+           MIN(plan_date) as week_start, MAX(plan_date) as week_end,
+           COUNTIF(session_type NOT IN ('rest', 'strength')) as planned_run_sessions,
+           COUNT(*) as planned_total_sessions
+    FROM `{BQ_PLAN}`
+    WHERE plan_date <= '{today_date.isoformat()}'
+      AND plan_date >= DATE_SUB('{today_date.isoformat()}', INTERVAL 6 DAY)
+    GROUP BY week_number, phase, week_target_km, week_target_vert
+    ORDER BY week_number DESC
+    LIMIT 1
+    """
+    plan_rows = list(client.query(q_plan).result())
+    if not plan_rows:
+        return None
+
+    pr = plan_rows[0]
+    week_start = pr.week_start
+    week_end = pr.week_end
+
+    # Get actual sessions this week from training_sessions
+    q_actual = f"""
+    SELECT COALESCE(SUM(distance_km), 0) as total_km,
+           COALESCE(SUM(elevation_gain_m), 0) as total_vert,
+           COUNT(*) as session_count
+    FROM `{BQ_TABLE}`
+    WHERE DATE(start_time) >= '{week_start.isoformat()}'
+      AND DATE(start_time) <= '{today_date.isoformat()}'
+    """
+    actual_rows = list(client.query(q_actual).result())
+    ar = actual_rows[0]
+
+    target_km = pr.week_target_km or 0
+    target_vert = pr.week_target_vert or 0
+    actual_km = float(ar.total_km or 0)
+    actual_vert = float(ar.total_vert or 0)
+
+    # Days elapsed in the week (for pace calculation)
+    days_elapsed = (today_date - week_start).days + 1
+    days_total = (week_end - week_start).days + 1
+    pct_week_elapsed = days_elapsed / max(days_total, 1)
+
+    km_pct = (actual_km / target_km * 100) if target_km > 0 else 0
+    vert_pct = (actual_vert / target_vert * 100) if target_vert > 0 else 0
+
+    # Determine on-track status
+    expected_km_pct = pct_week_elapsed * 100
+    if km_pct >= expected_km_pct - 10:
+        status = "on track"
+    elif km_pct >= expected_km_pct - 25:
+        status = "slightly behind"
+    else:
+        status = "behind"
+
+    if km_pct > expected_km_pct + 15:
+        status = "ahead"
+
+    return {
+        "week_number": pr.week_number,
+        "phase": pr.phase,
+        "target_km": target_km,
+        "target_vert": target_vert,
+        "actual_km": actual_km,
+        "actual_vert": actual_vert,
+        "planned_sessions": pr.planned_run_sessions,
+        "actual_sessions": int(ar.session_count or 0),
+        "km_pct": km_pct,
+        "vert_pct": vert_pct,
+        "status": status,
+        "days_elapsed": days_elapsed,
+        "days_total": days_total,
+    }
+
+
+def get_phase_status(today_date):
+    """Week-by-week compliance within the current phase."""
+    client = get_bq_client()
+
+    # First get today's phase
+    q_phase = f"""
+    SELECT phase FROM `{BQ_PLAN}`
+    WHERE plan_date = '{today_date.isoformat()}'
+    LIMIT 1
+    """
+    phase_rows = list(client.query(q_phase).result())
+    if not phase_rows:
+        return None
+    current_phase = phase_rows[0].phase
+
+    # Get all weeks in this phase
+    q_weeks = f"""
+    SELECT week_number, week_target_km, week_target_vert,
+           MIN(plan_date) as week_start, MAX(plan_date) as week_end
+    FROM `{BQ_PLAN}`
+    WHERE phase = '{current_phase}'
+    GROUP BY week_number, week_target_km, week_target_vert
+    ORDER BY week_number
+    """
+    week_rows = list(client.query(q_weeks).result())
+
+    weeks_in_phase = []
+    for wr in week_rows:
+        # Only include weeks up to today
+        if wr.week_start > today_date:
+            continue
+
+        q_actual = f"""
+        SELECT COALESCE(SUM(distance_km), 0) as total_km,
+               COALESCE(SUM(elevation_gain_m), 0) as total_vert,
+               COUNT(*) as sessions
+        FROM `{BQ_TABLE}`
+        WHERE DATE(start_time) >= '{wr.week_start.isoformat()}'
+          AND DATE(start_time) <= '{wr.week_end.isoformat()}'
+        """
+        ar = list(client.query(q_actual).result())[0]
+
+        target_km = wr.week_target_km or 0
+        actual_km = float(ar.total_km or 0)
+        compliance = (actual_km / target_km * 100) if target_km > 0 else 0
+
+        weeks_in_phase.append({
+            "week_number": wr.week_number,
+            "target_km": target_km,
+            "actual_km": actual_km,
+            "compliance_pct": compliance,
+            "sessions": int(ar.sessions or 0),
+        })
+
+    if not weeks_in_phase:
+        return None
+
+    avg_compliance = sum(w["compliance_pct"] for w in weeks_in_phase) / len(weeks_in_phase)
+
+    total_weeks_in_phase = len(week_rows)
+    completed_weeks = len(weeks_in_phase)
+
+    return {
+        "phase": current_phase,
+        "weeks": weeks_in_phase,
+        "avg_compliance": avg_compliance,
+        "completed_weeks": completed_weeks,
+        "total_weeks": total_weeks_in_phase,
+    }
+
+
+# ── Effort intensity comparison ──────────────────────────────────────────────
+
+def assess_effort_intensity(plan, avg_hr, max_hr_act):
+    """Compare actual effort against prescribed effort.
+    Returns (verdict, explanation) tuple."""
+    if not plan or not avg_hr:
+        return None, None
+
+    session_type = plan["session_type"]
+    target_rpe = plan.get("target_rpe", 0) or 0
+    target_hr_max = plan.get("target_hr_max")
+    effort_desc = plan.get("effort_description", "")
+
+    # Get expected HR range for this session type
+    hr_target = SESSION_HR_TARGETS.get(session_type)
+    if not hr_target:
+        return None, None
+
+    expected_min = hr_target["min"]
+    expected_max = hr_target["max"]
+    expected_zone = hr_target["zone"]
+
+    # Categorize actual effort
+    actual_zone = hr_zone(avg_hr)
+
+    # Easy sessions (RPE <= 4): check if went too hard
+    if target_rpe <= 4:
+        if avg_hr > expected_max + 10:
+            return ("TOO HARD", (
+                f"You turned an easy day into a threshold session. "
+                f"Your avg HR was {avg_hr:.0f} bpm but should have stayed below {expected_max} bpm ({expected_zone}). "
+                f"This defeats the purpose of polarised training. "
+                f"The plan said: \"{effort_desc}\" -- instead you ran at {actual_zone} intensity. "
+                f"Easy must be EASY. Walk uphills if your HR drifts above {expected_max}."
+            ))
+        elif avg_hr > expected_max:
+            return ("TOO HARD", (
+                f"Your avg HR of {avg_hr:.0f} bpm crept above the {expected_max} bpm ceiling for this session. "
+                f"Grey zone territory. Not easy enough to recover, not hard enough to improve. "
+                f"Next time: walk any climb that pushes HR above {expected_max}."
+            ))
+        elif avg_hr <= expected_max and avg_hr >= expected_min:
+            return ("NAILED IT", (
+                f"Avg HR {avg_hr:.0f} bpm -- right in the {expected_zone} zone. "
+                f"This is exactly the discipline that builds an aerobic engine. "
+                f"The plan said: \"{effort_desc}\" -- and that is what you delivered."
+            ))
+        else:
+            return ("NAILED IT", (
+                f"Avg HR {avg_hr:.0f} bpm -- well controlled, even conservative. Perfect for an easy day."
+            ))
+
+    # Hard sessions (RPE >= 7): check if went hard enough
+    if target_rpe >= 7:
+        if avg_hr < expected_min - 10:
+            return ("NOT HARD ENOUGH", (
+                f"You went too easy. This session should have had you gasping. "
+                f"Your HR averaged {avg_hr:.0f} bpm but should have been {expected_min}-{expected_max} bpm on the intervals. "
+                f"Push harder next time -- the Otter climbs will not be forgiving. "
+                f"The plan said: \"{effort_desc}\" -- did it feel like that? "
+                f"If you held back, you wasted a quality session. If you genuinely could not push harder, that is a fitness signal to address."
+            ))
+        elif avg_hr < expected_min:
+            return ("TOO EASY", (
+                f"Your avg HR of {avg_hr:.0f} bpm was below the target range of {expected_min}-{expected_max} bpm. "
+                f"For a {plan['session_name']}, you need to commit to the effort. "
+                f"The plan said: \"{effort_desc}\" -- next time, push into that zone and stay there."
+            ))
+        elif avg_hr > expected_max + 5:
+            return ("TOO HARD", (
+                f"Your avg HR of {avg_hr:.0f} bpm exceeded the {expected_max} bpm ceiling. "
+                f"You overcooked it. There is a difference between racing and training hard. "
+                f"Going too hard in training means you cannot recover for the next session. "
+                f"The plan prescribed {expected_zone}, not all-out."
+            ))
+        else:
+            return ("NAILED IT", (
+                f"Avg HR {avg_hr:.0f} bpm -- right in the prescribed {expected_zone} zone ({expected_min}-{expected_max} bpm). "
+                f"The plan said: \"{effort_desc}\" -- you delivered exactly that. "
+                f"This is how you build race fitness."
+            ))
+
+    # Moderate sessions (RPE 5-6): long runs, technical
+    if avg_hr > expected_max + 8:
+        return ("TOO HARD", (
+            f"Too hard for this session. Your avg HR of {avg_hr:.0f} bpm was well above the "
+            f"{expected_max} bpm ceiling. You are burning matches you need for race day. "
+            f"On a {plan['session_name']}, the effort should be sustainable for hours, not racing."
+        ))
+    elif avg_hr > expected_max:
+        return ("TOO HARD", (
+            f"Your avg HR drifted to {avg_hr:.0f} bpm, above the {expected_max} bpm target. "
+            f"On long/moderate sessions, HR should stay in {expected_zone}. Control the effort."
+        ))
+    elif avg_hr < expected_min - 15:
+        return ("TOO EASY", (
+            f"Your avg HR of {avg_hr:.0f} bpm was well below the expected range. "
+            f"This session needed more intention. The plan said: \"{effort_desc}\""
+        ))
+    else:
+        return ("NAILED IT", (
+            f"Avg HR {avg_hr:.0f} bpm -- well controlled in the {expected_zone} zone. "
+            f"The plan said: \"{effort_desc}\" -- and you executed it."
+        ))
+
+
+# ── Training history ─────────────────────────────────────────────────────────
+
+def get_training_history(weeks=4):
+    client = get_bq_client()
+    q = f"""
+    SELECT activity_name, activity_type, start_time, distance_km, duration_min,
+           elevation_gain_m, avg_hr, max_hr, hr_zone, aerobic_training_effect,
+           efficiency_index, avg_pace_min_km
+    FROM `{BQ_TABLE}`
+    WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {weeks * 7} DAY)
+    ORDER BY start_time DESC
+    """
+    return list(client.query(q).result())
+
+def format_training_context(rows):
+    if not rows:
+        return None
+
+    total_km = sum(r.distance_km or 0 for r in rows)
+    total_elev = sum(r.elevation_gain_m or 0 for r in rows)
+    total_dur = sum(r.duration_min or 0 for r in rows)
+    count = len(rows)
+
+    weeks = {}
+    for r in rows:
+        week_key = r.start_time.strftime("%W")
+        if week_key not in weeks:
+            weeks[week_key] = {"km": 0, "elev": 0, "count": 0, "dur": 0}
+        weeks[week_key]["km"] += r.distance_km or 0
+        weeks[week_key]["elev"] += r.elevation_gain_m or 0
+        weeks[week_key]["count"] += 1
+        weeks[week_key]["dur"] += r.duration_min or 0
+
+    avg_weekly_km = total_km / max(len(weeks), 1)
+
+    zone_counts = {}
+    for r in rows:
+        z = r.hr_zone or "N/A"
+        zone_counts[z] = zone_counts.get(z, 0) + 1
+
+    lines = []
+    lines.append(f"- Sessions: **{count}** | Total: **{total_km:.0f} km** / **+{total_elev:.0f}m** / **{fmt_duration(total_dur)}**")
+    lines.append(f"- Avg weekly volume: **{avg_weekly_km:.1f} km/week**")
+
+    zone_str = ", ".join(f"{z}: {c}" for z, c in sorted(zone_counts.items()))
+    lines.append(f"- Zone distribution: {zone_str}")
+
+    sorted_weeks = sorted(weeks.items())
+    if len(sorted_weeks) >= 2:
+        prev_km = sorted_weeks[-2][1]["km"]
+        curr_km = sorted_weeks[-1][1]["km"]
+        if prev_km > 0:
+            change = ((curr_km - prev_km) / prev_km) * 100
+            direction = "up" if change > 0 else "down"
+            lines.append(f"- Week-over-week volume: {direction} {abs(change):.0f}% ({prev_km:.0f} -> {curr_km:.0f} km)")
+
+    lines.append("")
+    return "\n".join(lines)
+
 # ── Activities ────────────────────────────────────────────────────────────────
 def get_recent_activities(client, days=3):
     activities = client.get_activities(0, 10)
@@ -167,8 +615,11 @@ def get_recent_activities(client, days=3):
             pass
     return recent
 
-# ── Analysis ──────────────────────────────────────────────────────────────────
-def analyse_activity(a, all_recent):
+# ── Main analysis (plan-aware) ───────────────────────────────────────────────
+
+def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
+                               week_progress, phase_status, training_context):
+    """Build the full plan-aware feedback email."""
     name      = a.get("activityName", "Unnamed")
     dt_str    = a.get("startTimeLocal", "")[:19]
     dt        = datetime.fromisoformat(dt_str)
@@ -184,193 +635,329 @@ def analyse_activity(a, all_recent):
     calories  = a.get("calories") or 0
     m_per_km  = round(elev_m / dist_km, 1) if dist_km else 0
 
-    lines = []
-    lines.append(f"# Daily Training Feedback — {dt.strftime('%A %d %B %Y')}")
-    lines.append(f"*Generated by your AI coaching assistant*\n")
+    days_to_race = (RACE_DATE - today_date).days
+    actual_zone = hr_zone(avg_hr) if avg_hr else "N/A"
 
-    lines.append("## Session Summary")
+    lines = []
+
+    # ── Header ──
+    week_num = plan["week_number"] if plan else "?"
+    phase = plan["phase"] if plan else "Pre-plan"
+    lines.append(f"# Daily Training Feedback -- {dt.strftime('%A %d %B %Y')}")
+    lines.append(f"*Week {week_num} of 13 | {phase} | **{days_to_race} days to Otter***")
+    lines.append("")
+
+    # ── Plan vs Actual ──
+    lines.append("## Today: Plan vs Actual")
+    if plan:
+        p_km = f"{plan['target_km']:.0f} km" if plan['target_km'] else "N/A"
+        p_vert = f"{plan['target_vert_m']:.0f}m vert" if plan['target_vert_m'] else "N/A"
+        p_zone = plan['target_hr_zone'] or "N/A"
+        p_rpe = plan['target_rpe'] or "N/A"
+        lines.append(f"PLANNED: {plan['session_name']}, {p_km}, {p_vert}, {p_zone}, RPE {p_rpe}")
+    else:
+        lines.append("PLANNED: No plan for today (outside plan dates)")
+
+    lines.append(f"DONE: {name}, {dist_km} km, +{elev_m:.0f}m vert, avg HR {avg_hr:.0f} ({actual_zone})" if avg_hr else f"DONE: {name}, {dist_km} km, +{elev_m:.0f}m vert")
+
+    # ── Effort verdict ──
+    if plan and plan["session_type"] not in ("rest", "strength"):
+        verdict, explanation = assess_effort_intensity(plan, avg_hr, max_hr_act)
+        if verdict:
+            lines.append(f"EFFORT VERDICT: {verdict}")
+            if explanation:
+                lines.append(explanation)
+    elif plan and plan["session_type"] == "rest":
+        lines.append(f"EFFORT VERDICT: Today was a REST day. You ran anyway. Was this a planned swap? If so, make sure you take the rest day elsewhere this week.")
+    elif plan and plan["session_type"] == "strength":
+        lines.append(f"EFFORT VERDICT: Today was a STRENGTH day in the plan. The run is bonus volume -- make sure you still do the strength work.")
+    lines.append("")
+
+    # ── Session Analysis ──
+    lines.append("## Session Analysis")
     lines.append(f"**{name}**")
     lines.append(f"- Type: {act_type.replace('_', ' ').title()}")
-    lines.append(f"- Distance: {dist_km} km")
-    lines.append(f"- Duration: {fmt_duration(dur_min)}")
-    lines.append(f"- Elevation: +{elev_m:.0f}m  ({m_per_km}m/km)")
+    lines.append(f"- Distance: {dist_km} km | Duration: {fmt_duration(dur_min)}")
+    lines.append(f"- Elevation: +{elev_m:.0f}m ({m_per_km}m/km)")
     lines.append(f"- Avg pace: {fmt_pace(avg_pace)}")
-    lines.append(f"- Avg HR: {avg_hr:.0f} bpm  |  Max HR: {max_hr_act:.0f} bpm" if avg_hr else "- HR: N/A")
-    lines.append(f"- Training Effect: {te:.1f}/5.0" if te else "")
-    lines.append(f"- VO2max estimate: {vo2:.0f}" if vo2 else "")
-    lines.append(f"- Calories: {calories:.0f} kcal\n")
-
     if avg_hr:
-        zone = hr_zone(avg_hr)
-        lines.append("## Heart Rate Analysis")
-        zone_desc = {
-            "Z1": "Recovery — very easy, below aerobic threshold",
-            "Z2": "Aerobic base — ideal for easy and long runs",
-            "Z3": "Tempo — comfortably hard, upper aerobic",
-            "Z4": "Threshold — lactate threshold zone, race effort",
-            "Z5": "VO2max — maximum effort, intervals only",
-        }
-        lines.append(f"**Average HR: {avg_hr:.0f} bpm → {zone} ({zone_desc[zone]})**")
-
-        if zone == "Z1":
-            lines.append("✅ Perfect recovery intensity. Your cardiovascular system is being efficiently restored.")
-        elif zone == "Z2":
-            lines.append("✅ Solid aerobic base work. This is where your fat oxidation engine is built.")
-            if avg_hr > 152:
-                lines.append("⚠️  Upper Z2 — watch for drift. If this was a 'long easy' session, aim to keep avg HR 5 bpm lower next time.")
-        elif zone == "Z3":
-            if "easy" in name.lower() or "recovery" in name.lower() or "z2" in name.lower():
-                lines.append("⚠️  **Zone mismatch**: Session was labelled easy/Z2 but avg HR landed in Z3.")
-                lines.append("   → This is the 'grey zone' — too hard to recover, not hard enough to meaningfully improve threshold.")
-                lines.append("   → Per Koop (Training Essentials for Ultrarunning): the grey zone is where most athletes over-train. Slow down on easy days.")
-            else:
-                lines.append("✅ Z3 is appropriate for quality mid-week efforts and trail terrain.")
-        elif zone == "Z4":
-            lines.append("🔴 High intensity session. Z4 requires 48h full recovery before next quality effort.")
-            lines.append("   → Limit Z4+ sessions to 1–2 per week maximum (Friel's 80/20 principle).")
-        elif zone == "Z5":
-            lines.append("🔴 Maximum effort. This should be rare — intervals or race only.")
-            lines.append("   → Ensure 2–3 easy days follow this session before any quality work.")
-
-        if max_hr_act and max_hr_act > 180:
-            lines.append(f"\n⚡ Max HR hit {max_hr_act:.0f} bpm — you pushed into true VO2max territory.")
-        lines.append("")
-
-    lines.append("## Effort Quality")
+        lines.append(f"- Avg HR: {avg_hr:.0f} bpm ({actual_zone}) | Max HR: {max_hr_act:.0f} bpm")
     if te:
-        if te >= 4.5:
-            lines.append(f"**Training Effect {te:.1f} — Highly Improving** ✅")
-            lines.append("Peak stimulus. Your body will adapt strongly to this session. Prioritise sleep tonight (aim 8–9hrs).")
-        elif te >= 3.5:
-            lines.append(f"**Training Effect {te:.1f} — Improving** ✅")
-            lines.append("Good training stimulus. This session is building your aerobic engine effectively.")
-        elif te >= 2.5:
-            lines.append(f"**Training Effect {te:.1f} — Maintaining** ⚪")
-            lines.append("Maintenance stimulus. Fine for a recovery day or high-volume week buffer.")
-        else:
-            lines.append(f"**Training Effect {te:.1f} — Recovery** 🔵")
-            lines.append("Very light session. Good if this was planned recovery; if not, consider adding more volume next time.")
+        lines.append(f"- Training Effect: {te:.1f}/5.0")
+    if vo2:
+        lines.append(f"- VO2max: {vo2:.0f}")
+    lines.append(f"- Calories: {calories:.0f} kcal")
 
     if m_per_km > 70:
-        lines.append(f"\n🏔️  **Mountain density: {m_per_km}m/km** — extremely vert-heavy.")
-        lines.append("   This demands specific quad and hip flexor recovery. Protein + elevation legs tonight.")
+        lines.append(f"- Mountain density: {m_per_km}m/km -- extremely vert-heavy")
     elif m_per_km > 40:
-        lines.append(f"\n⛰️  **Elevation density: {m_per_km}m/km** — solid mountain load.")
+        lines.append(f"- Elevation density: {m_per_km}m/km -- solid mountain load")
     elif m_per_km < 10 and dist_km > 10:
-        lines.append(f"\n🛣️  Flat session ({m_per_km}m/km). Good for speed/efficiency work.")
-    lines.append("")
+        lines.append(f"- Flat session ({m_per_km}m/km)")
 
     if avg_pace and avg_hr and avg_hr > 0:
-        lines.append("## Efficiency Index")
         speed_kmh = 60 / avg_pace
         efficiency = round(avg_hr / speed_kmh, 2)
-        lines.append(f"HR/Speed ratio: **{efficiency:.2f}** (lower = more efficient)")
-        if efficiency < 14.5:
-            lines.append("✅ Excellent aerobic efficiency. Your fitness is translating well to performance.")
-        elif efficiency < 16.5:
-            lines.append("✅ Good efficiency — normal for trail running with elevation.")
-        elif efficiency < 19.0:
-            lines.append("⚠️  Moderate efficiency. Could indicate fatigue, heat, or technical terrain.")
-        else:
-            lines.append("🔴 Low efficiency. Possible causes: accumulated fatigue, illness onset, excessive heat, or very steep terrain.")
-            lines.append("   → If this is 2nd+ day of low efficiency, consider a complete rest day.")
-        lines.append("")
-
-    lines.append("## Load Context")
-    total_recent_km = sum((a2.get("distance") or 0)/1000 for a2 in all_recent)
-    total_recent_elev = sum(a2.get("elevationGain") or 0 for a2 in all_recent)
-    lines.append(f"Last 3 days total: **{total_recent_km:.1f} km / +{total_recent_elev:.0f}m**")
-    if len(all_recent) >= 2:
-        days_run = len(all_recent)
-        if days_run >= 3:
-            lines.append(f"⚠️  {days_run} consecutive sessions in 3 days. Monitor for early fatigue signals.")
-            lines.append("   → Steve Magness: 'Accumulated fatigue is invisible until it isn't. Listen to the data.'")
-        else:
-            lines.append("✅ Load distribution looks balanced over the last 3 days.")
+        lines.append(f"- Efficiency index: {efficiency:.2f} (lower = more efficient)")
     lines.append("")
 
+    # ── 4-week overview (abbreviated) ──
+    if training_context:
+        lines.append("## 4-Week Overview")
+        lines.append(training_context)
+
+    # ── Week Progress ──
+    if week_progress:
+        wp = week_progress
+        lines.append("## Week Progress")
+        lines.append(f"Target: **{wp['target_km']:.0f} km** / **{wp['target_vert']:.0f}m** vert ({wp['planned_sessions']} run sessions)")
+        lines.append(f"Done: **{wp['actual_km']:.1f} km** / **{wp['actual_vert']:.0f}m** vert ({wp['actual_sessions']} sessions)")
+        lines.append(f"Status: **{wp['status']}** -- {wp['km_pct']:.0f}% of km target, {wp['vert_pct']:.0f}% of vert target (day {wp['days_elapsed']}/{wp['days_total']})")
+        lines.append("")
+
+    # ── Tomorrow ──
+    lines.append("## Tomorrow")
+    if tomorrow_plan:
+        tp = tomorrow_plan
+        if tp["session_type"] == "rest":
+            lines.append(f"**REST DAY.** {tp['description']}")
+            lines.append(f"\"{tp['effort_description']}\"")
+        elif tp["session_type"] == "strength":
+            lines.append(f"**{tp['session_name']}**")
+            lines.append(f"{tp['description']}")
+            lines.append(f"Effort: RPE {tp['target_rpe']} -- \"{tp['effort_description']}\"")
+        else:
+            t_km = f"{tp['target_km']:.0f} km" if tp['target_km'] else ""
+            t_vert = f", {tp['target_vert_m']:.0f}m vert" if tp['target_vert_m'] else ""
+            t_zone = f", {tp['target_hr_zone']}" if tp['target_hr_zone'] else ""
+            lines.append(f"**{tp['session_name']}** -- {t_km}{t_vert}{t_zone}, RPE {tp['target_rpe']}")
+            lines.append(f"{tp['description']}")
+            lines.append(f"\"{tp['effort_description']}\"")
+    else:
+        lines.append("No plan data for tomorrow.")
+    lines.append("")
+
+    # ── Phase Progress ──
+    if phase_status:
+        ps = phase_status
+        lines.append("## Phase Progress")
+        lines.append(f"**{ps['phase']}** (Week {ps['completed_weeks']} of {ps['total_weeks']}): **{ps['avg_compliance']:.0f}% compliance**")
+        for w in ps["weeks"]:
+            bar = "=" * int(min(w["compliance_pct"], 100) / 5) + "-" * (20 - int(min(w["compliance_pct"], 100) / 5))
+            lines.append(f"- Week {w['week_number']}: [{bar}] {w['compliance_pct']:.0f}% ({w['actual_km']:.0f}/{w['target_km']:.0f} km, {w['sessions']} sessions)")
+        lines.append("")
+
+    # ── Recovery Prescription (plan-aware) ──
     lines.append("## Recovery Prescription")
-    if te and te >= 4.5:
-        lines.append("- **Tonight**: 8–9hrs sleep. This is non-negotiable after a TE 4.5+ session.")
-        lines.append("- **Nutrition**: 1.6–2.0g protein/kg bodyweight. Carb refuel within 30min of finishing.")
-        lines.append("- **Tomorrow**: Easy Z2 only OR full rest. No quality work for 48hrs.")
-    elif te and te >= 3.5:
-        lines.append("- **Tonight**: 7–8hrs sleep. Legs up if possible in the evening.")
+    if plan and plan["session_type"] in ("vo2max", "prologue_sim", "race_sim", "threshold"):
+        lines.append("- **Tonight**: 8-9hrs sleep. Non-negotiable after this intensity.")
+        lines.append("- **Nutrition**: 1.6-2.0g protein/kg bodyweight. Carb refuel within 30min.")
+        lines.append("- **Tomorrow**: Follow the plan. If it prescribes rest, honour it.")
+    elif plan and plan.get("is_key_session"):
+        lines.append("- **Tonight**: 7-8hrs sleep. Legs up if possible.")
         lines.append("- **Nutrition**: Solid carb + protein meal within 60min.")
-        lines.append("- **Tomorrow**: Easy Z2 run fine. Avoid hills if legs feel heavy.")
-    elif zone == "Z4" or zone == "Z5" if avg_hr else False:
-        lines.append("- **Tonight**: Prioritise sleep — hard HR session needs full recovery.")
+        lines.append("- **Tomorrow**: Follow the plan. Key sessions demand proper recovery.")
+    elif te and te >= 4.5:
+        lines.append("- **Tonight**: 8-9hrs sleep. TE 4.5+ session demands full recovery.")
+        lines.append("- **Nutrition**: 1.6-2.0g protein/kg bodyweight. Carb refuel within 30min.")
+        lines.append("- **Tomorrow**: Easy Z2 only OR full rest. No quality work for 48hrs.")
+    elif avg_hr and hr_zone(avg_hr) in ("Z4", "Z5"):
+        lines.append("- **Tonight**: Prioritise sleep -- hard HR session needs full recovery.")
         lines.append("- **Tomorrow**: Full rest or 30min very easy jog only. HR must stay in Z1.")
     else:
         lines.append("- **Tonight**: Normal sleep (7hrs+).")
-        lines.append("- **Tomorrow**: Ready for quality work if scheduled.")
+        lines.append("- **Tomorrow**: Follow the plan.")
     if elev_m > 1000:
-        lines.append("- **Specific to today**: High elevation session — focus on quad foam rolling and calf stretching tonight.")
+        lines.append("- **Specific**: High elevation session -- quad foam rolling and calf stretching tonight.")
     lines.append("")
 
-    lines.append("## Tomorrow's Focus")
-    tomorrow = dt + timedelta(days=1)
-    lines.append(f"*{tomorrow.strftime('%A %d %B')}*")
-    if te and te >= 4.0 and (avg_hr and hr_zone(avg_hr) in ("Z3", "Z4", "Z5")):
-        lines.append("🔵 **Active recovery or full rest** — your body needs to absorb today's work.")
-        lines.append("   If running: max 45min, HR under 150, flat terrain, no effort.")
-    elif (avg_hr and hr_zone(avg_hr) == "Z2") and dist_km > 20:
-        lines.append("🟡 **Easy day** — long runs require recovery even at easy effort.")
-        lines.append("   If running: 45–60min easy, listen to your legs.")
-    elif (avg_hr and hr_zone(avg_hr) == "Z1") or (te and te < 2.5):
-        lines.append("🟢 **Ready for quality** — legs are fresh, good day for intervals or threshold work.")
+    # ── Race Countdown ──
+    lines.append("## Race Countdown")
+    lines.append(f"**{days_to_race} days to the Otter African Trail Run.**")
+    if days_to_race > 60:
+        lines.append(f"Building the foundation. Consistency now pays dividends in September.")
+    elif days_to_race > 30:
+        lines.append(f"Deep in the work. Every quality session is a deposit into race-day fitness.")
+    elif days_to_race > 14:
+        lines.append(f"Peak phase. Trust the process. The hay is almost in the barn.")
+    elif days_to_race > 7:
+        lines.append(f"Taper time. Less is more. You will feel restless -- that means it is working.")
+    elif days_to_race > 1:
+        lines.append(f"Race week. Trust the work. You are ready.")
     else:
-        lines.append("🟡 **Moderate day** — assess how legs feel in the morning. Easy Z2 is always a safe choice.")
+        lines.append(f"Race day. Leave nothing. The Otter rewards preparation.")
     lines.append("")
 
+    # ── Quote ──
     quotes = [
         ("Jason Koop", "The biggest mistake ultrarunners make is running their easy days too hard and their hard days not hard enough."),
         ("Kilian Jornet", "I don't train to be ready for a race. I train to be ready for life in the mountains."),
-        ("Joe Friel", "Aerobic capacity is built slowly, over years. It cannot be rushed — only damaged."),
-        ("Steve Magness", "Fatigue is a signal. The question is whether you're listening."),
-        ("Courtney Dauwalter", "Embrace the suffering. It means you're doing it right."),
-        ("Maffetone", "The faster you run slow, the faster you'll run fast."),
+        ("Joe Friel", "Aerobic capacity is built slowly, over years. It cannot be rushed -- only damaged."),
+        ("Steve Magness", "Fatigue is a signal. The question is whether you are listening."),
+        ("Courtney Dauwalter", "Embrace the suffering. It means you are doing it right."),
+        ("Maffetone", "The faster you run slow, the faster you will run fast."),
         ("Scott Jurek", "Consistency over intensity. Every time."),
     ]
     author, quote = random.choice(quotes)
-    lines.append(f"---")
+    lines.append("---")
     lines.append(f"*\"{quote}\"*")
-    lines.append(f"— **{author}**")
+    lines.append(f"-- **{author}**")
 
     return "\n".join(lines)
 
-def rest_day_feedback(last_activity_date):
-    today = datetime.today()
+
+def build_rest_day_feedback(today_date, last_activity_date, plan, tomorrow_plan,
+                             week_progress, phase_status):
+    """Build feedback for a day with no activity recorded."""
+    days_to_race = (RACE_DATE - today_date).days
+    week_num = plan["week_number"] if plan else "?"
+    phase = plan["phase"] if plan else "Pre-plan"
+
     lines = []
-    lines.append(f"# Daily Training Check — {today.strftime('%A %d %B %Y')}")
-    lines.append(f"*Generated by your AI coaching assistant*\n")
-    lines.append("## Today: Rest Day ✅")
-    lines.append(f"No activity recorded today or yesterday.")
+    lines.append(f"# Daily Training Feedback -- {today_date.strftime('%A %d %B %Y')}")
+    lines.append(f"*Week {week_num} of 13 | {phase} | **{days_to_race} days to Otter***")
+    lines.append("")
+
+    # ── Plan vs Actual ──
+    lines.append("## Today: Plan vs Actual")
+    if plan:
+        if plan["session_type"] == "rest":
+            lines.append(f"PLANNED: {plan['session_name']} -- {plan['description']}")
+            lines.append(f"DONE: No activity recorded")
+            lines.append(f"EFFORT VERDICT: NAILED IT -- rest was prescribed. {plan['effort_description']}")
+        elif plan["session_type"] == "strength":
+            lines.append(f"PLANNED: {plan['session_name']}")
+            lines.append(f"DONE: No Garmin activity recorded")
+            lines.append(f"Did you do the strength session? It will not appear in Garmin data.")
+            lines.append(f"Reminder: {plan['description']}")
+            lines.append(f"Effort target: RPE {plan['target_rpe']} -- \"{plan['effort_description']}\"")
+        else:
+            p_km = f"{plan['target_km']:.0f} km" if plan['target_km'] else "N/A"
+            p_vert = f"{plan['target_vert_m']:.0f}m vert" if plan['target_vert_m'] else "N/A"
+            lines.append(f"PLANNED: {plan['session_name']}, {p_km}, {p_vert}, RPE {plan['target_rpe']}")
+            lines.append(f"DONE: Nothing recorded")
+            is_key = plan.get("is_key_session", False)
+            if is_key:
+                lines.append(f"MISSED SESSION -- this was a KEY SESSION. {plan['session_name']} is one of the two critical sessions this week (quality Wednesday + long Sunday). Missing it creates a gap in your preparation that is hard to recover from. Can you reschedule within 48 hours?")
+            else:
+                lines.append(f"MISSED SESSION -- {plan['session_name']} was on the plan today. Life happens, but track the impact on your weekly targets below.")
+    else:
+        lines.append("No plan for today.")
+        lines.append("DONE: No activity recorded")
+    lines.append("")
+
+    # ── Days since last session ──
     if last_activity_date:
-        days_off = (today.date() - last_activity_date).days
+        days_off = (today_date - last_activity_date).days
         lines.append(f"Days since last session: **{days_off}**")
         if days_off <= 2:
-            lines.append("\n✅ Normal recovery window. Your body is adapting to the recent training load.")
-        elif days_off <= 5:
-            lines.append(f"\n⚠️  {days_off} days off. Check in with how you're feeling — illness or planned rest?")
+            lines.append("Normal recovery window.")
+        elif days_off <= 4:
+            lines.append(f"{days_off} days off. Check in with how you are feeling -- illness, travel, or planned rest?")
         else:
-            lines.append(f"\n🔴 {days_off} days without running. If unplanned, ease back with a short Z2 session tomorrow.")
-    lines.append("\n### Rest Day Recommendations")
-    lines.append("- 15–20min mobility work (hip flexors, glutes, calves)")
-    lines.append("- Hydration: 2–3L water")
-    lines.append("- Sleep 8hrs tonight to maximise adaptation from recent sessions")
-    lines.append("- Mental: visualise your MUT George race — route, pacing, nutrition execution")
+            lines.append(f"{days_off} days without running. If unplanned, ease back with a short Z2 session tomorrow.")
+        lines.append("")
+
+    # ── Week Progress ──
+    if week_progress:
+        wp = week_progress
+        lines.append("## Week Progress")
+        lines.append(f"Target: **{wp['target_km']:.0f} km** / **{wp['target_vert']:.0f}m** vert ({wp['planned_sessions']} run sessions)")
+        lines.append(f"Done: **{wp['actual_km']:.1f} km** / **{wp['actual_vert']:.0f}m** vert ({wp['actual_sessions']} sessions)")
+        lines.append(f"Status: **{wp['status']}** -- {wp['km_pct']:.0f}% of km target (day {wp['days_elapsed']}/{wp['days_total']})")
+        lines.append("")
+
+    # ── Tomorrow ──
+    lines.append("## Tomorrow")
+    if tomorrow_plan:
+        tp = tomorrow_plan
+        if tp["session_type"] == "rest":
+            lines.append(f"**REST DAY.** {tp['description']}")
+        elif tp["session_type"] == "strength":
+            lines.append(f"**{tp['session_name']}**")
+            lines.append(f"{tp['description']}")
+        else:
+            t_km = f"{tp['target_km']:.0f} km" if tp['target_km'] else ""
+            t_vert = f", {tp['target_vert_m']:.0f}m vert" if tp['target_vert_m'] else ""
+            t_zone = f", {tp['target_hr_zone']}" if tp['target_hr_zone'] else ""
+            lines.append(f"**{tp['session_name']}** -- {t_km}{t_vert}{t_zone}, RPE {tp['target_rpe']}")
+            lines.append(f"{tp['description']}")
+            lines.append(f"\"{tp['effort_description']}\"")
+    else:
+        lines.append("No plan data for tomorrow.")
+    lines.append("")
+
+    # ── Phase Progress ──
+    if phase_status:
+        ps = phase_status
+        lines.append("## Phase Progress")
+        lines.append(f"**{ps['phase']}** (Week {ps['completed_weeks']} of {ps['total_weeks']}): **{ps['avg_compliance']:.0f}% compliance**")
+        lines.append("")
+
+    # ── Recovery / Rest day guidance ──
+    lines.append("## Recovery Prescription")
+    if plan and plan["session_type"] == "rest":
+        lines.append("- Rest day as prescribed. Well done.")
+        lines.append("- 15-20min mobility work (hip flexors, glutes, calves)")
+        lines.append("- Hydration: 2-3L water")
+        lines.append("- Sleep 8hrs tonight to maximise adaptation")
+    else:
+        lines.append("- 15-20min mobility work (hip flexors, glutes, calves)")
+        lines.append("- Hydration: 2-3L water")
+        lines.append("- Sleep 8hrs tonight")
+    lines.append("")
+
+    # ── Race Countdown ──
+    lines.append("## Race Countdown")
+    lines.append(f"**{days_to_race} days to the Otter African Trail Run.**")
+    if plan and plan["session_type"] == "rest":
+        lines.append("Rest is part of the plan. Adaptation happens during recovery, not during training.")
+    elif plan and plan["session_type"] not in ("rest", "strength"):
+        lines.append("Consistency is the single biggest predictor of race-day performance. Every missed session adds up.")
+    lines.append("")
+
     return "\n".join(lines)
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 @functions_framework.http
 def garmin_daily_feedback(request):
-    """HTTP Cloud Function entry point — triggered by Cloud Scheduler."""
+    """HTTP Cloud Function entry point -- triggered by Cloud Scheduler."""
     try:
         client = load_garmin_client()
         recent = get_recent_activities(client, days=2)
 
+        # Save all recent activities to BQ (deduped)
+        for act in get_recent_activities(client, days=3):
+            try:
+                save_session_to_bq(act)
+            except Exception as e:
+                print(f"BQ save failed for activity: {e}")
+
+        # Read training history for context
+        training_context = None
+        try:
+            history = get_training_history(weeks=4)
+            training_context = format_training_context(history)
+        except Exception as e:
+            print(f"BQ history read failed: {e}")
+
+        # Get plan data
+        today_date = datetime.today().date()
+        plan = None
+        tomorrow_plan = None
+        week_progress = None
+        phase_status = None
+        try:
+            plan = get_todays_plan(today_date)
+            tomorrow_plan = get_tomorrows_plan(today_date)
+            week_progress = get_week_progress(today_date)
+            phase_status = get_phase_status(today_date)
+        except Exception as e:
+            print(f"Plan query failed: {e}")
+
         if not recent:
+            # No activity -- rest day or missed session
             all_acts = client.get_activities(0, 5)
             last_date = None
             if all_acts:
@@ -378,16 +965,23 @@ def garmin_daily_feedback(request):
                     last_date = datetime.fromisoformat(all_acts[0].get("startTimeLocal","")[:19]).date()
                 except:
                     pass
-            feedback = rest_day_feedback(last_date)
+            feedback = build_rest_day_feedback(
+                today_date, last_date, plan, tomorrow_plan,
+                week_progress, phase_status
+            )
         else:
+            # Activity found -- full analysis
             latest = sorted(recent, key=lambda x: x.get("startTimeLocal",""), reverse=True)[0]
             all_recent_3d = get_recent_activities(client, days=3)
-            feedback = analyse_activity(latest, all_recent_3d)
+            feedback = build_plan_aware_feedback(
+                latest, all_recent_3d, today_date, plan, tomorrow_plan,
+                week_progress, phase_status, training_context
+            )
 
         save_tokens_if_refreshed()
 
         today_label = datetime.today().strftime("%a %d %b")
-        subject = f"🏔️ Training Feedback — {today_label}"
+        subject = f"Training Feedback -- {today_label}"
         send_email(subject, feedback)
 
         print(feedback)
