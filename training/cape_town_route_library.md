@@ -34,7 +34,28 @@ error that has happened (2026-07-08) — the itinerary was in memory and was mis
 **Known 2026 travel windows (extend/replace as itinerary updates):**
 - **2026-07-03 → 2026-07-18: Provence, France** (Domaine du Golf de Pont Royal, Mallemort). Use **Visorando** (French home turf).
 - **2026-07-19 → 2026-07-31: Menorca, Spain** (Sant Lluís / Mahón). Use **Wikiloc** (strong Menorca coverage; Visorando thin there).
-- **2026-08-01 onward: Cape Town** (home) — use the Cape Town table below.
+- **2026-08-01 → 2026-08-13: Sanilhac-Sagriès (Uzès), Gard, France** — staying at "Les Boissieres", 30700 Sanilhac-Sagriès, on the Gorges du Gardon rim. Use **Visorando**. Route set below. (Itinerary updated 2026-08-04 — the earlier "back in Cape Town 31 Jul" plan changed.)
+- **2026-08-14 onward: Cape Town** (home) — use the Cape Town table below.
+
+### Uzès / Sanilhac-Sagriès route set (Visorando) — matches Garmin courses uploaded 2026-08-04
+Trailheads ≤ ~11 min drive from Les Boissieres except Mont Bouquet (~35 min, long-run exception).
+Terrain reality: garrigue plateau + gorge — max ~430 m sustained climb (Mont Bouquet); gorge loops give 200–400 m.
+
+| Session type | Route (Visorando) | km / D+ | Trailhead (drive) | Link |
+|---|---|---|---|---|
+| tempo / threshold | Les Capitelles de Blauzac | 12.6 / 156 m | Place du 8 Mai 1945, Blauzac (~7 min) | https://www.visorando.com/en/walk-les-capitelles-de-blauzac/ |
+| hill_repeats / double vertical | Boucle du Pont Saint-Nicolas (rim-to-river repeats) | 13.6 / ~360 m | Pont St-Nicolas parking, D979 (~11 min) | https://www.visorando.com/randonnee-boucle-du-pont-saint-nicolas/ |
+| long_run | Mont Bouquet double loop: Seynes + Brouzet | 16.7/540 + 10.9/430 | Seynes mairie (~35 min) | https://www.visorando.com/en/walk-le-mont-bouquet-au-depart-de-seynes/ + https://www.visorando.com/en/walk-mont-bouquet-par-bouzet-les-ales/ |
+| easy_trail / recovery | Vallon de l'Ermitage de Collias (shaded, river swim) | 10.2 / 193 m | Collias bridge car park (~10 min) | https://www.visorando.com/en/walk-vallon-de-l-ermitage-de-collias-et-crete/ |
+| prologue_sim / TT | La Chapelle et Grotte de la Baume (steep technical) | 5.7 / 199 m | Sanilhac-Sagriès village square (2 min) | https://www.visorando.com/en/walk-la-chapelle-et-grotte-de-la-baume-a-part/ |
+
+Also verified nearby (unused backups): Boucle de Collias 11.1/163; Carrières romaines Vers-Pont-du-Gard 13.4/114; Pont du Gard/aqueduc 13.5/316; Bois des Coufines 10.1/295 (technical, partly unmarked); Gorges du Gardon Russan→Collias 20.7/406 (point-to-point, needs pickup); Lussan/Concluses 23.2/413 (~30 min).
+
+**Visorando GPX without login (discovered 2026-08-04):** the anonymous endpoint
+`https://www.visorando.com/en/index.php?component=exportData&task=getRandoGeoJson&chartData=1&wholePointsData=1&idRandonnee=<ID>`
+returns full track points + elevation profile (`chartdata`), no account needed. `<ID>` = numeric `idRandonnee` in the route page HTML. Pipeline script (GeoJSON→GPX→Garmin course): scratchpad `visorando_to_garmin.py` session 2026-08-04; Garmin course save = POST `course-service/course/import` (multipart GPX) then POST `course-service/course` with `activityTypePk`, `sourceTypeId:3`, `coursePrivacy:{privacyRulePk:2}`, `startPoint` filled.
+
+**intervals.icu → Garmin push (confirmed 2026-08-04):** a nightly job (~03:00 UTC) auto-creates each planned Run/WeightTraining workout in Garmin Connect ~6 days ahead, and re-pushes within seconds whenever the intervals event is edited. The Garmin workout description = ONLY the prose ABOVE the `---` separator in the intervals event description. So route/start-point lines MUST live in that prose block (above `---`), not appended at the bottom — direct edits to the Garmin workout get overwritten on next sync. Never manually create Garmin workouts for dates ≤6 days out — the push will duplicate them.
 
 ### Provence route set (Visorando) — matches routes already uploaded to Garmin Connect (2026-06-28)
 | Session type | Location | Link |

@@ -34,6 +34,13 @@ ROUTE = {
  "https://www.wikiloc.com/trail-running-trails/menorca-cami-de-cavalls-etapa-5-calan-porter-punta-prima-14307423": ("Cala'n Porter (Cami de Cavalls trailhead)", "39.8720,4.1330"),
  "https://www.wikiloc.com/hiking-trails/menorca-es-mercadal-monte-toro-13979275": ("Es Mercadal (Monte Toro road base)", "39.9910,4.0913"),
  "https://es.wikiloc.com/rutas-senderismo/menorca-cami-de-cavalls-1a-etapa-mao-cap-de-favaritx-37077334": ("Mao (Mahon) port", "39.8885,4.2645"),
+ # --- Uzes / Sanilhac-Sagries, Gard (Visorando) - holiday 2026-08-01 -> 2026-08-13 ---
+ "https://www.visorando.com/en/walk-les-capitelles-de-blauzac/": ("Place du 8 Mai 1945, Blauzac", "43.96335,4.370302"),
+ "https://www.visorando.com/randonnee-boucle-du-pont-saint-nicolas/": ("Pont Saint-Nicolas parking, D979", "43.944522,4.377674"),
+ "https://www.visorando.com/en/walk-le-mont-bouquet-au-depart-de-seynes/": ("Seynes mairie parking", "44.11641,4.284624"),
+ "https://www.visorando.com/en/walk-mont-bouquet-par-bouzet-les-ales/": ("Brouzet-les-Ales church parking", "44.136749,4.245229"),
+ "https://www.visorando.com/en/walk-vallon-de-l-ermitage-de-collias-et-crete/": ("Collias bridge car park, riverside", "43.953501,4.481131"),
+ "https://www.visorando.com/en/walk-la-chapelle-et-grotte-de-la-baume-a-part/": ("Sanilhac-Sagries village square", "43.953544,4.425291"),
 }
 def maps(coords): return f"https://www.google.com/maps/search/?api=1&query={coords}"
 
