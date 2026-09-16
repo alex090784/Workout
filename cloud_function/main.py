@@ -226,6 +226,13 @@ GARMIN_STRENGTH_TYPES = {"strength_training", "indoor_cardio", "fitness_equipmen
 # speculatively; if the plan vocabulary changes, update this set to match.
 INTERVAL_SESSION_TYPES = {"vo2max", "threshold", "hill_repeats", "sharpener"}
 
+# Session types excluded from fade-based verdict downgrade (Aria's ruling via
+# Marco, 2026-09-16): sharpener reps are very short/sharp with full recovery
+# between them -- too much rep-to-rep HR noise for a first-half-vs-second-half
+# fade read to mean anything. Excluded ENTIRELY (no fade commentary at all for
+# this session_type, not just no downgrade).
+FADE_EXCLUDED_SESSION_TYPES = {"sharpener"}
+
 def _plan_category(session_type):
     if session_type in BIKE_SESSION_TYPES: return "bike"
     if session_type in RUN_SESSION_TYPES: return "run"
@@ -803,28 +810,111 @@ def assess_interval_effort(plan, activity_id, garmin_client):
     rep_hrs = [l["averageHR"] for l in work]  # chronological -- laps come back in activity order
 
     # `significant_fade` is a VERDICT input, not just narrative (Rune IMPORTANT,
-    # 2026-09-16): the fade check used to compute a genuine "you didn't hold it"
-    # signal and then only mention it in prose, leaving verdict selection to ignore
-    # it entirely -- so an email could read "NAILED IT" immediately followed by
-    # "you did not hold the target through to the end of the set." Self-contradicting
-    # output is worse than a slightly more conservative verdict.
+    # 2026-09-16 round 2): a fade signal must feed verdict selection, never just
+    # narrate -- an email must never read "NAILED IT" immediately followed by
+    # "you did not hold the target through to the end of the set."
+    #
+    # FADE-VS-ARTIFACT REDESIGN (Aria's ruling via Marco, 2026-09-16 round 3):
+    # a raw HR drop between first-half and second-half reps is ambiguous -- on
+    # real trail/hill terrain a rep cut short at a road crossing, or a later
+    # hill-rep landing on a different section of climb, reads identically to
+    # genuine fatigue. Fixed by judging EFFICIENCY (HR per unit of output),
+    # not raw HR, gated on a terrain-consistency precheck, and requiring an
+    # actual decoupling pattern (HR holding/rising while output falls) rather
+    # than a raw HR decline. If any precondition fails, the fade line is
+    # OMITTED entirely -- silence, not a guess -- per Aria's explicit
+    # acceptance criterion: fade must never downgrade a verdict on evidence
+    # that can't support it.
     fade_note = ""
     significant_fade = False
-    if len(rep_hrs) >= 4:
-        half = len(rep_hrs) // 2
-        first_half_avg = sum(rep_hrs[:half]) / half
-        second_half_avg = sum(rep_hrs[half:]) / (len(rep_hrs) - half)
-        drop = first_half_avg - second_half_avg
-        if drop >= 5:
-            significant_fade = True
-            fade_note = (f" Reps faded across the set: first half averaged {first_half_avg:.0f} bpm, "
-                         f"second half {second_half_avg:.0f} bpm ({drop:.0f} bpm drop) -- you did not "
-                         f"hold the target through to the end of the set.")
-        elif drop <= -3:
-            fade_note = (f" No fade -- first half averaged {first_half_avg:.0f} bpm, second half "
-                         f"{second_half_avg:.0f} bpm. You held or built through the set.")
-        else:
-            fade_note = f" Consistent across all {len(rep_hrs)} reps ({min(rep_hrs):.0f}-{max(rep_hrs):.0f} bpm)."
+    # (1) sharpener excluded ENTIRELY -- very short/sharp reps with full
+    # recovery carry too much rep-to-rep HR noise for a fade read to mean
+    # anything, not just an unfair downgrade; no fade commentary at all for
+    # this session_type, not even a positive "held efficiency" note.
+    if session_type not in FADE_EXCLUDED_SESSION_TYPES and len(rep_hrs) >= 4:
+        # (4) Terrain-consistency precheck: rep distances within ~30% of the
+        # (approximate) median. Reps that vary more than that aren't
+        # comparable -- one may be a genuinely different climb section or a
+        # shortened rep, not a fatigue signal. Gates the WHOLE fade read, not
+        # just the downgrade half, because "held efficiency" is equally
+        # invalid to claim on inconsistent terrain.
+        work_dists = [l.get("distance") or 0 for l in work]
+        sorted_dists = sorted(work_dists)
+        median_dist = sorted_dists[len(sorted_dists) // 2]
+        terrain_consistent = median_dist > 0 and all(
+            abs(d - median_dist) / median_dist <= 0.30 for d in work_dists
+        )
+        if terrain_consistent:
+            # (3) Efficiency ratio = HR / grade-adjusted output, not raw HR.
+            # Output term chosen: distance PLUS a vertical-gain equivalent,
+            # divided by duration ("grade-adjusted effective speed") -- not
+            # plain pace, deliberately: for hill reps a pace-only denominator
+            # is itself confounded by WHERE on the climb a given rep sits
+            # (steeper section = slower pace at the same effort), so distance
+            # alone can't tell "went slower" apart from "climbed a harder
+            # bit." VERT_EQUIV_FACTOR=8 is a mid-range value from the
+            # commonly-cited ~7-10x horizontal-equivalent energy cost of a
+            # vertical metre in trail running -- it only has to be internally
+            # consistent for a same-session first-half-vs-second-half
+            # comparison, not physiologically exact, so 7 vs 10 doesn't
+            # change the conclusion here.
+            VERT_EQUIV_FACTOR = 8
+
+            def _rep_output(l):
+                dist = l.get("distance") or 0
+                elev = l.get("elevationGain") or 0
+                dur = l.get("duration") or 0
+                if dur <= 0:
+                    return None
+                return (dist + VERT_EQUIV_FACTOR * elev) / dur  # effective m/s
+
+            outputs = [_rep_output(l) for l in work]
+            if all(o is not None and o > 0 for o in outputs):
+                # HR / output: a RISING ratio means more heartbeats per unit of
+                # work done as the set goes on -- decoupling. A flat or falling
+                # ratio means efficiency held even if raw HR happened to drop
+                # (that rep just produced the same or more work for less HR --
+                # the opposite of fatigue).
+                ratios = [l["averageHR"] / o for l, o in zip(work, outputs)]
+                half = len(ratios) // 2
+                first_half_ratio = sum(ratios[:half]) / half
+                second_half_ratio = sum(ratios[half:]) / (len(ratios) - half)
+                ratio_rise_pct = (
+                    ((second_half_ratio - first_half_ratio) / first_half_ratio) * 100
+                    if first_half_ratio else 0
+                )
+                # (5) Decoupling requires HR holding or rising while output falls --
+                # not just a ratio artifact. A small noise tolerance (2bpm) avoids
+                # rejecting a genuine flat-HR case on rounding.
+                first_half_hr = sum(rep_hrs[:half]) / half
+                second_half_hr = sum(rep_hrs[half:]) / (len(rep_hrs) - half)
+                hr_not_falling = second_half_hr >= first_half_hr - 2
+
+                # (2) Threshold mapped onto the new ratio-based metric: a raw-bpm
+                # trigger doesn't transfer to a unitless ratio, so this is judgement,
+                # not derivation -- picked 10% ratio rise as the significance bar,
+                # consistent with the common endurance-coaching convention that
+                # flags >5-10% Pace:HR / Power:HR decoupling as a genuine
+                # aerobic-efficiency concern rather than noise (open to
+                # recalibration if Aria's coaching read disagrees once this has
+                # run against real sessions).
+                if ratio_rise_pct >= 10 and hr_not_falling:
+                    significant_fade = True
+                    fade_note = (
+                        f" Efficiency faded across the set: HR cost per unit of effort rose "
+                        f"{ratio_rise_pct:.0f}% from the first half to the second half (HR "
+                        f"{second_half_hr:.0f} bpm in the second half vs {first_half_hr:.0f} bpm in "
+                        f"the first, while output fell) -- you did not hold the target through to "
+                        f"the end of the set."
+                    )
+                elif ratio_rise_pct <= -10:
+                    fade_note = " Efficiency held or improved across the set -- no fade."
+                else:
+                    fade_note = f" Efficiency held steady across all {len(work)} reps."
+                # else (missing duration/elevation on any rep): can't compute output --
+                # fade_note stays "", omitted rather than guessed.
+            # else (terrain inconsistent across reps): fade_note stays "", omitted.
+        # else (sharpener, or <4 reps to compare halves): fade_note stays "", omitted.
 
     expected_min, expected_max = hr_target["min"], hr_target["max"]
     rep_minutes = structure["rep_minutes"]
