@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
 Daily Garmin Connect session analyser — GCP Cloud Function version
-Plan-aware training feedback for the Otter African Trail Run 2026.
+Plan-aware training feedback for UTCT PT55 (RMB Ultra-Trail Cape Town,
+Peninsula Traverse 55km, Llandudno -> Gardens RC, Fri 20 Nov 2026).
+Otter African Trail Run 2026 was cancelled 2026-08-16; PT55 is now the
+sole A-race. The 14-week block (Build-In -> Build -> Specificity -> Peak
+-> Taper -> Race) lives in BQ `abmtest-429810.garmin_training.training_plan`,
+2026-08-17 through 2026-11-22.
 
-Pulls yesterday's activity, compares against the 13-week training plan in BQ,
-and generates coaching feedback with effort-intensity verdicts.
+Pulls the latest activity, compares it against the prescribed session for
+that day (type, distance, duration, elevation, HR effort), and generates
+an explicit adherence verdict (ON PLAN / PARTIAL / OFF PLAN / MISSED) —
+not a participation trophy. Praise is only printed when the data supports it.
 
 Inspired by: Jason Koop (ultrarunning), Joe Friel (triathlete's bible),
              Steve Magness (science of running), Maffetone (aerobic base)
 """
 
+import html
 import json
 import os
 import re
@@ -34,9 +42,11 @@ TOKEN_DIR    = "/tmp/.garth"
 LT_HR        = 176
 MAX_HR       = 198
 
-# Race date: Otter Day 2 main race
-RACE_DATE    = date(2026, 9, 24)
-PLAN_START   = date(2026, 6, 29)
+# Race date: UTCT PT55 (Peninsula Traverse 55km), Llandudno -> Gardens RC.
+# Otter African Trail Run 2026 was cancelled 2026-08-16 -- PT55 is now the
+# sole A-race. Block runs 2026-08-17 (Build-In wk1) -> 2026-11-22 (post-race).
+RACE_DATE    = date(2026, 11, 20)
+PLAN_START   = date(2026, 8, 17)
 
 # ── Secret Manager ────────────────────────────────────────────────────────────
 def get_secret(secret_id):
@@ -77,23 +87,31 @@ def save_tokens_if_refreshed():
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 def send_email(subject, markdown_body):
+    """Returns True on confirmed send, False on any failure. Callers must
+    check this and surface a non-200 response on False -- otherwise Cloud
+    Scheduler sees a 200 and never retries a silently-dropped email (e.g.
+    a rotated Gmail app password or an SMTP outage)."""
     try:
         gmail_user = get_secret("garmin-gmail-user")
         app_password = get_secret("garmin-gmail-app-password")
         recipient = gmail_user
-        html = markdown_to_html(markdown_body)
+        # NOT named `html` -- that would shadow the module-level `import html`
+        # (used for escaping Garmin free text) for the rest of this function.
+        html_body = markdown_to_html(markdown_body)
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"]    = f"Coach Aria <{gmail_user}>"
         msg["To"]      = recipient
         msg.attach(MIMEText(markdown_body, "plain"))
-        msg.attach(MIMEText(html, "html"))
+        msg.attach(MIMEText(html_body, "html"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_user, app_password)
             smtp.sendmail(gmail_user, recipient, msg.as_string())
         print("Email sent successfully")
+        return True
     except Exception as e:
         print(f"Email failed: {e}")
+        return False
 
 def markdown_to_html(md):
     lines = md.split("\n")
@@ -112,16 +130,18 @@ def markdown_to_html(md):
             html_lines.append(f'<p style="font-weight:700;margin:8px 0">{line[2:-2]}</p>')
         elif line.startswith("- "):
             html_lines.append(f'<li style="margin:4px 0;line-height:1.5">{line[2:]}</li>')
-        elif line.startswith("EFFORT VERDICT:"):
-            # Special styling for effort verdicts
-            if "NAILED IT" in line:
+        elif line.startswith("ADHERENCE VERDICT:"):
+            # Special styling for the adherence verdict (ON PLAN / PARTIAL / OFF PLAN / MISSED / UNCONFIRMED)
+            if "ON PLAN" in line:
                 html_lines.append(f'<p style="color:#2d6a4f;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#e8f5e9;border-radius:6px">{line}</p>')
-            elif "TOO EASY" in line or "NOT HARD ENOUGH" in line:
+            elif "PARTIAL" in line or "UNCONFIRMED" in line:
                 html_lines.append(f'<p style="color:#e65100;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#fff3e0;border-radius:6px">{line}</p>')
-            elif "TOO HARD" in line:
+            elif "OFF PLAN" in line or "MISSED" in line:
                 html_lines.append(f'<p style="color:#c62828;font-weight:700;font-size:15px;margin:10px 0;padding:8px;background:#ffebee;border-radius:6px">{line}</p>')
             else:
                 html_lines.append(f'<p style="font-weight:700;margin:10px 0;padding:8px;background:#f5f5f5;border-radius:6px">{line}</p>')
+        elif line.startswith("Effort intensity:"):
+            html_lines.append(f'<p style="margin:4px 0 4px 8px;line-height:1.6;color:#333">{line}</p>')
         elif line.startswith("PLANNED:") or line.startswith("DONE:"):
             html_lines.append(f'<p style="font-family:monospace;margin:4px 0;line-height:1.6;background:#f8f9fa;padding:4px 8px;border-radius:4px">{line}</p>')
         elif any(line.startswith(e) for e in ["Status:", "Target:", "Done:"]):
@@ -149,21 +169,75 @@ ZONES = {
     "Z5": (178, 999),
 }
 
-# Expected HR ranges per session type for effort comparison
+# Expected HR ranges per session type for effort comparison.
+# Kept in sync with the session_type vocabulary in the PT55 block
+# (abmtest-429810.garmin_training.training_plan). Update this dict
+# whenever a new session_type is introduced in the plan, or sessions
+# of that type will silently get NO effort verdict (see assess_effort_intensity).
 SESSION_HR_TARGETS = {
     "easy_trail":    {"min": 120, "max": 150, "zone": "Z1-Z2"},
-    "easy_road":     {"min": 120, "max": 150, "zone": "Z1-Z2"},
     "long_run":      {"min": 135, "max": 160, "zone": "Z2"},
-    "tempo":         {"min": 158, "max": 170, "zone": "Z3-Z4"},
     "threshold":     {"min": 167, "max": 178, "zone": "Z4"},
     "hill_repeats":  {"min": 160, "max": 178, "zone": "Z3-Z4"},
     "vo2max":        {"min": 175, "max": 192, "zone": "Z5"},
-    "prologue_sim":  {"min": 170, "max": 188, "zone": "Z4-Z5"},
-    "race_sim":      {"min": 145, "max": 168, "zone": "Z2-Z3"},
     "sharpener":     {"min": 165, "max": 180, "zone": "Z4-Z5"},
     "activation":    {"min": 120, "max": 145, "zone": "Z1"},
     "race":          {"min": 155, "max": 185, "zone": "Z2-Z5"},
+    "recce":         {"min": 130, "max": 158, "zone": "Z2"},        # course recon -- steady, technique focus
+    "downhill":      {"min": 130, "max": 165, "zone": "Z2-Z3"},     # eccentric loading -- effort is technical, not HR-defined
+    "bike":          {"min": 120, "max": 150, "zone": "Z1-Z2"},     # road bike aerobic/leg-speed
+    "mtb":           {"min": 130, "max": 162, "zone": "Z2-Z3"},     # more vert/technical load than road bike
 }
+
+# Category groups: which Garmin activity types plausibly satisfy which
+# plan session_type. Used to catch "wrong sport entirely" (e.g. plan said
+# bike, you ran) before any HR-based intensity check even runs.
+RUN_SESSION_TYPES   = {"easy_trail", "long_run", "threshold", "hill_repeats", "vo2max",
+                        "sharpener", "activation", "race", "recce", "downhill"}
+BIKE_SESSION_TYPES  = {"bike", "mtb"}
+STRENGTH_SESSION_TYPES = {"strength"}
+REST_SESSION_TYPES  = {"rest"}
+
+# Includes indoor/treadmill/street variants -- a common bad-weather
+# substitution (e.g. treadmill_running for a planned outdoor easy run) is
+# still the SAME SPORT and must not trip the wrong-sport gate in
+# assess_adherence(). Anything not in these sets categorises as "other" and
+# WILL trip that gate against a run/bike plan session (see the widened
+# act_cat != plan_cat check) -- keep this list in sync with Garmin's actual
+# activityType.typeKey taxonomy as new variants are seen in the wild.
+GARMIN_RUN_TYPES  = {"running", "trail_running", "track_running", "ultra_run",
+                      "obstacle_run", "virtual_run", "hiking",
+                      "treadmill_running", "indoor_running", "street_running"}
+GARMIN_BIKE_TYPES = {"road_biking", "mountain_biking", "cycling", "gravel_cycling",
+                      "virtual_ride", "indoor_cycling", "cyclocross",
+                      "track_cycling"}
+GARMIN_STRENGTH_TYPES = {"strength_training", "indoor_cardio", "fitness_equipment"}
+
+# session_type values that are prescribed as warm-up + work reps + recovery +
+# cool-down (confirmed against every row in training_plan on 2026-09-16: each
+# of these carries a "Warm up Xkm ... NxYmin ... Cool down Xkm" description and
+# a "Course on watch" structured workout). Whole-activity average HR on these
+# is meaningless -- it blends four different intensities into one number.
+# 'long_run' can ALSO contain a race-effort segment (see e.g. 2026-09-13,
+# "Race-Effort Segment") but is NOT included here: it's one continuous run
+# with an embedded effort block, not a rep/recovery structure, and its
+# whole-activity average remains a fair (if blunt) signal for a long day.
+# There is no 'intervals' session_type in the plan data -- don't add one
+# speculatively; if the plan vocabulary changes, update this set to match.
+INTERVAL_SESSION_TYPES = {"vo2max", "threshold", "hill_repeats", "sharpener"}
+
+def _plan_category(session_type):
+    if session_type in BIKE_SESSION_TYPES: return "bike"
+    if session_type in RUN_SESSION_TYPES: return "run"
+    if session_type in STRENGTH_SESSION_TYPES: return "strength"
+    if session_type in REST_SESSION_TYPES: return "rest"
+    return "other"
+
+def _activity_category(garmin_type):
+    if garmin_type in GARMIN_BIKE_TYPES: return "bike"
+    if garmin_type in GARMIN_RUN_TYPES: return "run"
+    if garmin_type in GARMIN_STRENGTH_TYPES: return "strength"
+    return "other"
 
 def hr_zone(hr):
     for z, (lo, hi) in ZONES.items():
@@ -190,16 +264,22 @@ def get_bq_client():
     return bq_client
 
 def save_session_to_bq(a):
-    """Write a Garmin activity to BQ. Skips if activity_id already exists."""
+    """Write a Garmin activity to BQ via an atomic MERGE (WHEN NOT MATCHED
+    THEN INSERT). The previous SELECT-then-INSERT was non-atomic: two
+    overlapping instances (a Scheduler retry racing the original run, or a
+    manual trigger overlapping the scheduled one) could both see "not
+    present" and both insert -- duplicating the row AND duplicating the
+    email. max-instances=1 on this function's deploy config is the primary
+    guard against the overlap itself; this MERGE is the second, independent
+    layer in case that's ever changed or bypassed."""
     client = get_bq_client()
     activity_id = a.get("activityId")
     if not activity_id:
         return
-
-    q = f"SELECT 1 FROM `{BQ_TABLE}` WHERE activity_id = {activity_id} LIMIT 1"
-    result = list(client.query(q).result())
-    if result:
-        print(f"Activity {activity_id} already in BQ, skipping")
+    try:
+        activity_id = int(activity_id)
+    except (TypeError, ValueError):
+        print(f"Skipping activity with non-integer activity_id: {activity_id!r}")
         return
 
     dist_km = round((a.get("distance") or 0) / 1000, 2)
@@ -213,36 +293,61 @@ def save_session_to_bq(a):
     speed_kmh = 60 / avg_pace if avg_pace and avg_pace > 0 else None
     efficiency = round(avg_hr / speed_kmh, 2) if avg_hr and speed_kmh else None
 
-    row = {
-        "activity_id": activity_id,
-        "activity_name": a.get("activityName", "Unnamed"),
-        "activity_type": a.get("activityType", {}).get("typeKey", "unknown"),
-        "start_time": a.get("startTimeLocal", "")[:19].replace("T", " "),
-        "distance_km": dist_km,
-        "duration_min": dur_min,
-        "elevation_gain_m": elev_m,
-        "avg_hr": avg_hr,
-        "max_hr": max_hr_val,
-        "avg_pace_min_km": avg_pace,
-        "aerobic_training_effect": a.get("aerobicTrainingEffect"),
-        "vo2max": a.get("vO2MaxValue"),
-        "calories": a.get("calories"),
-        "elevation_density_m_km": m_per_km,
-        "hr_zone": zone,
-        "efficiency_index": efficiency,
-        "inserted_at": datetime.utcnow().isoformat(),
-    }
+    activity_name = a.get("activityName", "Unnamed")
+    activity_type = (a.get("activityType") or {}).get("typeKey", "unknown")
+    # Same "naive local string, interpreted as UTC" semantics as the old
+    # insert_rows_json call -- TIMESTAMP(string) treats a timezone-less
+    # string as UTC, same as the streaming insert API did.
+    start_time_str = (a.get("startTimeLocal") or "")[:19].replace("T", " ")
+    inserted_at_str = datetime.utcnow().isoformat()
 
-    errors = client.insert_rows_json(BQ_TABLE, [row])
-    if errors:
-        print(f"BQ insert error: {errors}")
+    q = f"""
+    MERGE `{BQ_TABLE}` T
+    USING (SELECT @activity_id AS activity_id) S
+    ON T.activity_id = S.activity_id
+    WHEN NOT MATCHED THEN
+      INSERT (activity_id, activity_name, activity_type, start_time, distance_km,
+              duration_min, elevation_gain_m, avg_hr, max_hr, avg_pace_min_km,
+              aerobic_training_effect, vo2max, calories, elevation_density_m_km,
+              hr_zone, efficiency_index, inserted_at)
+      VALUES (@activity_id, @activity_name, @activity_type, TIMESTAMP(@start_time),
+              @distance_km, @duration_min, @elevation_gain_m, @avg_hr, @max_hr,
+              @avg_pace_min_km, @aerobic_training_effect, @vo2max, @calories,
+              @elevation_density_m_km, @hr_zone, @efficiency_index, TIMESTAMP(@inserted_at))
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("activity_id", "INT64", activity_id),
+        bigquery.ScalarQueryParameter("activity_name", "STRING", activity_name),
+        bigquery.ScalarQueryParameter("activity_type", "STRING", activity_type),
+        bigquery.ScalarQueryParameter("start_time", "STRING", start_time_str),
+        bigquery.ScalarQueryParameter("distance_km", "FLOAT64", dist_km),
+        bigquery.ScalarQueryParameter("duration_min", "FLOAT64", dur_min),
+        bigquery.ScalarQueryParameter("elevation_gain_m", "FLOAT64", elev_m),
+        bigquery.ScalarQueryParameter("avg_hr", "FLOAT64", avg_hr),
+        bigquery.ScalarQueryParameter("max_hr", "FLOAT64", max_hr_val),
+        bigquery.ScalarQueryParameter("avg_pace_min_km", "FLOAT64", avg_pace),
+        bigquery.ScalarQueryParameter("aerobic_training_effect", "FLOAT64", a.get("aerobicTrainingEffect")),
+        bigquery.ScalarQueryParameter("vo2max", "FLOAT64", a.get("vO2MaxValue")),
+        bigquery.ScalarQueryParameter("calories", "FLOAT64", a.get("calories")),
+        bigquery.ScalarQueryParameter("elevation_density_m_km", "FLOAT64", m_per_km),
+        bigquery.ScalarQueryParameter("hr_zone", "STRING", zone),
+        bigquery.ScalarQueryParameter("efficiency_index", "FLOAT64", efficiency),
+        bigquery.ScalarQueryParameter("inserted_at", "STRING", inserted_at_str),
+    ])
+    result_job = client.query(q, job_config=job_config)
+    result_job.result()
+    if result_job.num_dml_affected_rows:
+        print(f"Saved activity {activity_id} to BQ (MERGE inserted {result_job.num_dml_affected_rows} row)")
     else:
-        print(f"Saved activity {activity_id} to BQ")
+        print(f"Activity {activity_id} already in BQ, skipping")
 
 # ── Plan queries ─────────────────────────────────────────────────────────────
 
 def get_todays_plan(today_date):
-    """Query BQ for today's planned session. Returns dict or None."""
+    """Query BQ for the planned session on the given date. Returns dict or None.
+    Despite the name, this is called with any date (see garmin_daily_feedback,
+    which keys the adherence comparison to the ACTIVITY's own date, not
+    necessarily today) -- kept generic on purpose."""
     client = get_bq_client()
     q = f"""
     SELECT plan_date, week_number, phase, day_of_week, session_type, session_name,
@@ -250,10 +355,13 @@ def get_todays_plan(today_date):
            target_hr_max, target_rpe, week_target_km, week_target_vert,
            description, effort_description, is_key_session
     FROM `{BQ_PLAN}`
-    WHERE plan_date = '{today_date.isoformat()}'
+    WHERE plan_date = @plan_date
     LIMIT 1
     """
-    rows = list(client.query(q).result())
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("plan_date", "DATE", today_date)]
+    )
+    rows = list(client.query(q, job_config=job_config).result())
     if not rows:
         return None
     r = rows[0]
@@ -296,13 +404,16 @@ def get_week_progress(today_date):
            COUNTIF(session_type NOT IN ('rest', 'strength')) as planned_run_sessions,
            COUNT(*) as planned_total_sessions
     FROM `{BQ_PLAN}`
-    WHERE plan_date <= '{today_date.isoformat()}'
-      AND plan_date >= DATE_SUB('{today_date.isoformat()}', INTERVAL 6 DAY)
+    WHERE plan_date <= @today_date
+      AND plan_date >= DATE_SUB(@today_date, INTERVAL 6 DAY)
     GROUP BY week_number, phase, week_target_km, week_target_vert
     ORDER BY week_number DESC
     LIMIT 1
     """
-    plan_rows = list(client.query(q_plan).result())
+    plan_job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("today_date", "DATE", today_date)]
+    )
+    plan_rows = list(client.query(q_plan, job_config=plan_job_config).result())
     if not plan_rows:
         return None
 
@@ -316,10 +427,16 @@ def get_week_progress(today_date):
            COALESCE(SUM(elevation_gain_m), 0) as total_vert,
            COUNT(*) as session_count
     FROM `{BQ_TABLE}`
-    WHERE DATE(start_time) >= '{week_start.isoformat()}'
-      AND DATE(start_time) <= '{today_date.isoformat()}'
+    WHERE DATE(start_time) >= @week_start
+      AND DATE(start_time) <= @today_date
     """
-    actual_rows = list(client.query(q_actual).result())
+    actual_job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("week_start", "DATE", week_start),
+            bigquery.ScalarQueryParameter("today_date", "DATE", today_date),
+        ]
+    )
+    actual_rows = list(client.query(q_actual, job_config=actual_job_config).result())
     ar = actual_rows[0]
 
     target_km = pr.week_target_km or 0
@@ -371,10 +488,13 @@ def get_phase_status(today_date):
     # First get today's phase
     q_phase = f"""
     SELECT phase FROM `{BQ_PLAN}`
-    WHERE plan_date = '{today_date.isoformat()}'
+    WHERE plan_date = @today_date
     LIMIT 1
     """
-    phase_rows = list(client.query(q_phase).result())
+    phase_job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("today_date", "DATE", today_date)]
+    )
+    phase_rows = list(client.query(q_phase, job_config=phase_job_config).result())
     if not phase_rows:
         return None
     current_phase = phase_rows[0].phase
@@ -384,11 +504,14 @@ def get_phase_status(today_date):
     SELECT week_number, week_target_km, week_target_vert,
            MIN(plan_date) as week_start, MAX(plan_date) as week_end
     FROM `{BQ_PLAN}`
-    WHERE phase = '{current_phase}'
+    WHERE phase = @phase
     GROUP BY week_number, week_target_km, week_target_vert
     ORDER BY week_number
     """
-    week_rows = list(client.query(q_weeks).result())
+    weeks_job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("phase", "STRING", current_phase)]
+    )
+    week_rows = list(client.query(q_weeks, job_config=weeks_job_config).result())
 
     weeks_in_phase = []
     for wr in week_rows:
@@ -401,10 +524,16 @@ def get_phase_status(today_date):
                COALESCE(SUM(elevation_gain_m), 0) as total_vert,
                COUNT(*) as sessions
         FROM `{BQ_TABLE}`
-        WHERE DATE(start_time) >= '{wr.week_start.isoformat()}'
-          AND DATE(start_time) <= '{wr.week_end.isoformat()}'
+        WHERE DATE(start_time) >= @week_start
+          AND DATE(start_time) <= @week_end
         """
-        ar = list(client.query(q_actual).result())[0]
+        wk_job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("week_start", "DATE", wr.week_start),
+                bigquery.ScalarQueryParameter("week_end", "DATE", wr.week_end),
+            ]
+        )
+        ar = list(client.query(q_actual, job_config=wk_job_config).result())[0]
 
         target_km = wr.week_target_km or 0
         actual_km = float(ar.total_km or 0)
@@ -435,9 +564,219 @@ def get_phase_status(today_date):
     }
 
 
+_total_weeks_cache = None
+
+def get_total_weeks():
+    """Total weeks in the current plan block, read from BQ so this never
+    goes stale again when the plan is revised or replaced (see 2026-08
+    Otter->PT55 switch, where 'Week X of 13' kept printing after the plan
+    became a 14-week PT55 block)."""
+    global _total_weeks_cache
+    if _total_weeks_cache is not None:
+        return _total_weeks_cache
+    try:
+        client = get_bq_client()
+        q = f"SELECT MAX(week_number) as n FROM `{BQ_PLAN}`"
+        rows = list(client.query(q).result())
+        _total_weeks_cache = int(rows[0].n) if rows and rows[0].n else None
+    except Exception as e:
+        print(f"get_total_weeks failed: {e}")
+        _total_weeks_cache = None
+    return _total_weeks_cache
+
+
+# ── Interval-session effort assessment ──────────────────────────────────────
+# Root cause fixed here (2026-09): assess_effort_intensity() below judges a
+# session by its WHOLE-ACTIVITY average HR. For a steady effort (easy_trail,
+# long_run) that's the right number. For a structured interval session
+# (INTERVAL_SESSION_TYPES) it is not -- averaging warm-up + hard reps +
+# recovery jogs + cool-down together produces a number that describes none
+# of them. On 2026-09-16 this fired "NOT HARD ENOUGH" on a 6x3min Z5 hill
+# session because the whole-activity average (147bpm, diluted by a 2km
+# warm-up and 2km cool-down) undercut the Z5 floor, when the isolated work
+# reps averaged 167bpm / peaked at 176-177bpm -- a well-executed session.
+# This is the false-criticism mirror of the false-praise bug fixed in
+# August: judging a structured session by a single aggregate is wrong in
+# both directions.
+
+def _parse_session_structure(description):
+    """Pull (warmup_km, cooldown_km, rep_count, rep_minutes) out of the plan's
+    free-text description. Every INTERVAL_SESSION_TYPES row seen so far
+    follows 'Warm up Xkm. ... NxYmin ... Cool down Xkm.' (or 'Nx hill reps,
+    ~Ymin climb'). Any field this can't find comes back None -- callers must
+    treat that as "unknown", never assume a default."""
+    d = description or ""
+    wu = re.search(r'[Ww]arm[- ]?up\s+([\d.]+)\s*km', d)
+    cd = re.search(r'[Cc]ool[- ]?down\s+([\d.]+)\s*km', d)
+    rep = re.search(r'(\d+)\s*x\.?\s*(?:hill reps,?\s*~?)?(\d+)\s*min', d)
+    return {
+        "warmup_km":   float(wu.group(1)) if wu else None,
+        "cooldown_km": float(cd.group(1)) if cd else None,
+        "rep_count":   int(rep.group(1)) if rep else None,
+        "rep_minutes": int(rep.group(2)) if rep else None,
+    }
+
+
+def fetch_activity_laps(garmin_client, activity_id):
+    """One extra Garmin Connect call: GET activity-service/activity/{id}/splits.
+    Read-only, reuses the already-authenticated session from load_garmin_client
+    -- no extra login/token exchange, so no incremental exposure to the 429s
+    that have taken this pipeline down before. Only called once per daily run,
+    and only for the single activity being analysed (never for the whole
+    recent-activities list). Fails soft: any error returns [] so the caller
+    falls back to UNCONFIRMED instead of raising and losing the whole email."""
+    try:
+        data = garmin_client.get_activity_splits(activity_id)
+        return data.get("lapDTOs") or []
+    except Exception as e:
+        print(f"fetch_activity_laps failed for activity {activity_id}: {e}")
+        return []
+
+
+def assess_interval_effort(plan, activity_id, garmin_client):
+    """Assess a structured/interval session (INTERVAL_SESSION_TYPES) by
+    isolating the WORK reps from warm-up, recovery jogs, and cool-down --
+    never by whole-activity average HR. Returns (verdict, explanation) using
+    the existing verdict vocabulary (NAILED IT / TOO HARD / TOO EASY /
+    NOT HARD ENOUGH), plus UNCONFIRMED whenever the lap data can't support a
+    confident read. UNCONFIRMED is a deliberate answer, not a fallback to the
+    old (wrong) whole-activity number -- guessing confidently from bad data
+    is worse than admitting the data doesn't support a verdict.
+    """
+    session_type = plan["session_type"]
+    hr_target = SESSION_HR_TARGETS.get(session_type)
+    if not hr_target:
+        return None, None
+
+    laps = fetch_activity_laps(garmin_client, activity_id)
+    if len(laps) < 3:
+        return "UNCONFIRMED", (
+            "This was a structured interval session, but Garmin returned fewer than 3 laps for it -- "
+            "not enough to separate warm-up, work reps, recovery, and cool-down. Whole-activity average "
+            "HR is not a valid substitute; it blends all four into one number that represents none of "
+            "them. Intensity on the work reps could not be confirmed this time."
+        )
+
+    # Structured-workout laps carry a non-'ACTIVE' intensityType (this Garmin
+    # account's data shows 'INTERVAL' end-to-end on a real structured
+    # workout, including its warm-up/cool-down laps). Plain GPS auto-lap on a
+    # free run (no course loaded) comes back 'ACTIVE' with near-identical
+    # lap distances and carries NO rep-boundary information at all -- two of
+    # three threshold/hill_repeats sessions checked on 2026-09-16 were this
+    # case (auto-lapped every 1km, no course loaded that day).
+    structured = any((l.get("intensityType") or "ACTIVE") != "ACTIVE" for l in laps)
+    # NULL guard convention (established 2026-08, domain_kai_devops.md): `l.get(k) or 0`,
+    # not `l.get(k, 0)` -- the two-arg form only fires its default on a MISSING key, not on
+    # a key present with an explicit `None`, which is exactly what a null lap field comes
+    # back as from the Garmin API.
+    interior_dists = [l.get("distance") or 0 for l in laps[:-1]]
+    autolap_uniform = len(interior_dists) >= 3 and (max(interior_dists) - min(interior_dists)) < 50
+
+    if not structured or autolap_uniform:
+        return "UNCONFIRMED", (
+            "Lap data on this activity looks like default GPS auto-lap (even splits), not the "
+            "structured interval workout the plan prescribed -- there's no way to separate work reps "
+            "from recovery in this data. Load the course/structured workout on the watch for this "
+            "session type; until then, intensity on the work reps can't be confirmed."
+        )
+
+    structure = _parse_session_structure(plan.get("description"))
+    interior = list(laps)
+    # Same NULL guard as above -- direct `["distance"]` indexing would KeyError on a
+    # missing field and a bare `/1000` would TypeError on an explicit `None`; either
+    # crashes this function uncaught (fetch_activity_laps only guards the API call
+    # itself, not this post-processing), which loses the whole day's email, not just
+    # this verdict.
+    if structure["warmup_km"] and interior and (interior[0].get("distance") or 0) / 1000 >= structure["warmup_km"] * 0.6:
+        interior = interior[1:]
+    if structure["cooldown_km"] and interior and (interior[-1].get("distance") or 0) / 1000 >= structure["cooldown_km"] * 0.5:
+        interior = interior[:-1]
+    interior = [l for l in interior if l.get("averageHR")]
+
+    if len(interior) < 2:
+        return "UNCONFIRMED", (
+            "Could not isolate work reps from warm-up/cool-down in the lap data for this session."
+        )
+
+    # Work vs recovery split: laps at/above the midpoint between the lowest
+    # and highest interior avg HR are the hard reps, the rest are recovery
+    # jogs. Heuristic, not a Garmin-provided label -- holds up on every
+    # structured workout inspected so far because a genuine work rep reads
+    # meaningfully higher than the recovery either side of it, but a
+    # pathological case (e.g. recovery HR never drops) could fool it.
+    hrs = [l["averageHR"] for l in interior]
+    midpoint = (max(hrs) + min(hrs)) / 2
+    work = [l for l in interior if l["averageHR"] >= midpoint]
+
+    if not work:
+        return "UNCONFIRMED", "Could not distinguish work reps from recovery in the lap data."
+
+    work_avg_hr = sum(l["averageHR"] for l in work) / len(work)
+    work_max_hr = max(l.get("maxHR") or 0 for l in work)
+    rep_hrs = [l["averageHR"] for l in work]  # chronological -- laps come back in activity order
+
+    fade_note = ""
+    if len(rep_hrs) >= 4:
+        half = len(rep_hrs) // 2
+        first_half_avg = sum(rep_hrs[:half]) / half
+        second_half_avg = sum(rep_hrs[half:]) / (len(rep_hrs) - half)
+        drop = first_half_avg - second_half_avg
+        if drop >= 5:
+            fade_note = (f" Reps faded across the set: first half averaged {first_half_avg:.0f} bpm, "
+                         f"second half {second_half_avg:.0f} bpm ({drop:.0f} bpm drop) -- you did not "
+                         f"hold the target through to the end of the set.")
+        elif drop <= -3:
+            fade_note = (f" No fade -- first half averaged {first_half_avg:.0f} bpm, second half "
+                         f"{second_half_avg:.0f} bpm. You held or built through the set.")
+        else:
+            fade_note = f" Consistent across all {len(rep_hrs)} reps ({min(rep_hrs):.0f}-{max(rep_hrs):.0f} bpm)."
+
+    expected_min, expected_max = hr_target["min"], hr_target["max"]
+    rep_minutes = structure["rep_minutes"]
+
+    # Short reps (<=4min) don't give HR time to plateau before the rep ends --
+    # judging avg-HR-during-rep against a steady-state zone floor is not a
+    # fair read there (Magness/Koop: cardiac lag on short VO2max efforts).
+    # Max HR reached, plus consistency across reps, is the honest signal.
+    # Longer reps (threshold-style, ~6min+) give HR time to settle, so
+    # average-during-rep is treated as a fair signal there, same as before.
+    if rep_minutes and rep_minutes <= 4:
+        if work_max_hr >= expected_min - 3:
+            verdict = "NAILED IT"
+            expl = (f"Work reps peaked at {work_max_hr:.0f} bpm (avg {work_avg_hr:.0f} bpm across "
+                    f"{len(work)} reps).{fade_note} On {rep_minutes}-min reps, HR does not have time to "
+                    f"plateau at the target average before the rep ends -- max HR reached and consistency "
+                    f"across reps are the honest read here, and both look good. "
+                    f"The plan said: \"{plan.get('effort_description','')}\".")
+        else:
+            verdict = "NOT HARD ENOUGH"
+            expl = (f"Work reps only reached {work_max_hr:.0f} bpm max (avg {work_avg_hr:.0f} bpm across "
+                    f"{len(work)} reps) -- below the {expected_min} bpm floor even accounting for HR lag "
+                    f"on short reps.{fade_note} Push harder on the climbs next time.")
+    else:
+        if work_avg_hr < expected_min - 10:
+            verdict = "NOT HARD ENOUGH"
+            expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- well short of "
+                    f"the {expected_min}-{expected_max} bpm target.{fade_note}")
+        elif work_avg_hr < expected_min:
+            verdict = "TOO EASY"
+            expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- just under the "
+                    f"{expected_min} bpm floor.{fade_note}")
+        elif work_avg_hr > expected_max + 5:
+            verdict = "TOO HARD"
+            expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- over the "
+                    f"{expected_max} bpm ceiling.{fade_note}")
+        else:
+            verdict = "NAILED IT"
+            expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- right in the "
+                    f"{expected_min}-{expected_max} bpm target zone.{fade_note}")
+
+    return verdict, expl
+
+
 # ── Effort intensity comparison ──────────────────────────────────────────────
 
-def assess_effort_intensity(plan, avg_hr, max_hr_act):
+def assess_effort_intensity(plan, avg_hr):
     """Compare actual effort against prescribed effort.
     Returns (verdict, explanation) tuple."""
     if not plan or not avg_hr:
@@ -493,7 +832,7 @@ def assess_effort_intensity(plan, avg_hr, max_hr_act):
             return ("NOT HARD ENOUGH", (
                 f"You went too easy. This session should have had you gasping. "
                 f"Your HR averaged {avg_hr:.0f} bpm but should have been {expected_min}-{expected_max} bpm on the intervals. "
-                f"Push harder next time -- the Otter climbs will not be forgiving. "
+                f"Push harder next time -- Suther Peak in the first 10km of PT55 will not be forgiving. "
                 f"The plan said: \"{effort_desc}\" -- did it feel like that? "
                 f"If you held back, you wasted a quality session. If you genuinely could not push harder, that is a fitness signal to address."
             ))
@@ -541,9 +880,213 @@ def assess_effort_intensity(plan, avg_hr, max_hr_act):
         ))
 
 
+# ── Adherence verdict (plan vs actual, not just HR) ──────────────────────────
+# This is the fix for the "nailed it regardless" defect: assess_effort_intensity
+# above ONLY looks at avg HR. It never checked whether the session that was
+# actually done resembles the one that was prescribed -- same sport, same
+# rough distance/duration/vert. A session that was the wrong sport entirely,
+# or 3x the prescribed vert, or half the prescribed distance, could still
+# come back "NAILED IT" purely because HR happened to land in a zone.
+# assess_adherence() is the outer check that runs first and can override
+# the HR verdict with OFF PLAN / PARTIAL / MISSED. No text below is allowed
+# to soften a verdict the numbers don't support.
+
+SEVERE_SHORT_RATIO   = 0.50   # < 50% of prescribed distance/duration = cut drastically short
+PARTIAL_SHORT_RATIO  = 0.75
+MAJOR_OVERSHOOT_RATIO = 1.50  # distance/duration
+FLAG_OVERSHOOT_RATIO  = 1.30
+MAJOR_VERT_OVERSHOOT  = 2.00
+FLAG_VERT_OVERSHOOT   = 1.50
+FLAT_SESSION_VERT_CAP_M = 150  # if plan target_vert_m is 0/None, actual vert above this is notable
+
+def assess_adherence(plan, actual, garmin_client=None, activity_id=None):
+    """Compare the ACTUAL session (type, distance, duration, elevation, HR)
+    against the PRESCRIBED session for the day.
+
+    Returns a dict:
+      verdict: "ON PLAN" | "PARTIAL" | "OFF PLAN" | None (no plan for today)
+      reasons: list of str, structural mismatches (sport/distance/duration/vert)
+      intensity_verdict / intensity_explanation: the HR-based sub-verdict
+        (NAILED IT / TOO HARD / TOO EASY / NOT HARD ENOUGH / UNCONFIRMED),
+        still reported but no longer the whole story.
+    `actual` is a dict with keys: act_type, name, dist_km, dur_min, elev_m,
+    avg_hr, max_hr.
+    `garmin_client` / `activity_id` are optional and only used when
+    plan["session_type"] is in INTERVAL_SESSION_TYPES -- assessing those
+    needs a per-lap Garmin call (assess_interval_effort), not just the
+    whole-activity `actual` dict. If either is missing on an interval
+    session, the verdict comes back UNCONFIRMED rather than silently
+    falling back to the whole-activity-average path that produces false
+    verdicts on structured sessions.
+    """
+    if not plan:
+        return {"verdict": None, "reasons": [], "intensity_verdict": None, "intensity_explanation": None}
+
+    reasons = []
+    plan_cat = _plan_category(plan["session_type"])
+    act_cat = _activity_category(actual.get("act_type"))
+
+    # 1. Wrong sport entirely -- decisive, skip HR check, it's not meaningful.
+    # Any mismatch counts, including "other" (swim/yoga/elliptical/paddle/
+    # anything not in the run/bike/strength Garmin type sets) -- that used to
+    # fall through to the numeric ratio comparison below and could score
+    # ON PLAN purely because distance/duration happened to line up.
+    if plan_cat in ("run", "bike") and act_cat != plan_cat:
+        # act_cat is one of our own fixed category strings (run/bike/strength/
+        # other), safe as-is; the "other" fallback surfaces the raw Garmin
+        # typeKey, which -- like activityName -- is escaped before it can
+        # reach the HTML-rendered "reasons" list.
+        logged_desc = act_cat if act_cat != "other" else html.escape(actual.get("act_type") or "unrecognised-type")
+        reasons.append(
+            f"WRONG SESSION TYPE: plan called for a {plan_cat} session "
+            f"(\"{plan['session_name']}\"), you logged a {logged_desc} activity (\"{actual.get('name')}\")."
+        )
+        return {"verdict": "OFF PLAN", "reasons": reasons, "intensity_verdict": None, "intensity_explanation": None}
+
+    dist_ratio = (actual["dist_km"] / plan["target_km"]) if plan.get("target_km") and actual.get("dist_km") else None
+    dur_ratio  = (actual["dur_min"] / plan["target_duration_min"]) if plan.get("target_duration_min") and actual.get("dur_min") else None
+    vert_ratio = None
+    if plan.get("target_vert_m") and plan["target_vert_m"] > 0 and actual.get("elev_m") is not None:
+        vert_ratio = actual["elev_m"] / plan["target_vert_m"]
+
+    # Zero-distance activities (GPS loss, indoor/treadmill without a distance
+    # sensor, manual entry) fall back to duration-only comparison below via
+    # dist_ratio being None -- flag that explicitly instead of silently
+    # re-routing, so Alexis knows why distance wasn't checked.
+    if plan.get("target_km") and actual.get("dist_km") == 0:
+        reasons.append(
+            "NOTE: activity logged 0km distance (GPS loss or manual entry?) -- "
+            "falling back to duration only for the distance comparison."
+        )
+
+    severe_short = (dist_ratio is not None and dist_ratio < SEVERE_SHORT_RATIO) or \
+                   (dist_ratio is None and dur_ratio is not None and dur_ratio < SEVERE_SHORT_RATIO)
+    partial_short = (not severe_short) and dist_ratio is not None and dist_ratio < PARTIAL_SHORT_RATIO
+
+    if severe_short:
+        reasons.append(
+            f"SESSION CUT SHORT: {actual.get('dist_km', 0):.1f}km / {fmt_duration(actual.get('dur_min', 0))} "
+            f"done vs {plan['target_km']:.0f}km / {fmt_duration(plan['target_duration_min'])} prescribed "
+            f"({(dist_ratio or dur_ratio) * 100:.0f}% of target)."
+        )
+    elif partial_short:
+        reasons.append(
+            f"SHORT OF TARGET: {actual['dist_km']:.1f}km vs {plan['target_km']:.0f}km prescribed "
+            f"({dist_ratio * 100:.0f}% of target distance)."
+        )
+
+    dist_major_overshoot = dist_ratio is not None and dist_ratio > MAJOR_OVERSHOOT_RATIO
+    dist_flag_overshoot  = dist_ratio is not None and FLAG_OVERSHOOT_RATIO < dist_ratio <= MAJOR_OVERSHOOT_RATIO
+    if dist_ratio is not None and dist_ratio > FLAG_OVERSHOOT_RATIO:
+        reasons.append(
+            f"DISTANCE OVERSHOOT: {actual['dist_km']:.1f}km vs {plan['target_km']:.0f}km prescribed "
+            f"(+{(dist_ratio - 1) * 100:.0f}%)."
+        )
+
+    vert_major_overshoot = vert_ratio is not None and vert_ratio > MAJOR_VERT_OVERSHOOT
+    vert_flag_overshoot  = vert_ratio is not None and FLAG_VERT_OVERSHOOT < vert_ratio <= MAJOR_VERT_OVERSHOOT
+    if vert_ratio is not None and vert_ratio > FLAG_VERT_OVERSHOOT:
+        reasons.append(
+            f"VERT OVERSHOOT: +{actual.get('elev_m', 0):.0f}m vs +{plan['target_vert_m']:.0f}m prescribed "
+            f"({vert_ratio * 100:.0f}% of target -- materially harder terrain than planned)."
+        )
+
+    # Vert UNDERSHOOT -- a vert-focused session (mtb, hill_repeats, downhill...)
+    # replaced by a flat session at target distance/duration was previously
+    # invisible here: only overshoot was checked. Mirrors the distance
+    # severe/partial-short thresholds above.
+    vert_severe_short  = vert_ratio is not None and vert_ratio < SEVERE_SHORT_RATIO
+    vert_partial_short = (not vert_severe_short) and vert_ratio is not None and vert_ratio < PARTIAL_SHORT_RATIO
+    if vert_severe_short:
+        reasons.append(
+            f"VERT UNDERSHOOT: +{actual.get('elev_m', 0):.0f}m vs +{plan['target_vert_m']:.0f}m prescribed "
+            f"({vert_ratio * 100:.0f}% of target -- the intended climbing stimulus is largely missing)."
+        )
+    elif vert_partial_short:
+        reasons.append(
+            f"VERT SHORT OF TARGET: +{actual.get('elev_m', 0):.0f}m vs +{plan['target_vert_m']:.0f}m prescribed "
+            f"({vert_ratio * 100:.0f}% of target)."
+        )
+
+    flat_mismatch = False
+    if (not plan.get("target_vert_m")) and actual.get("elev_m", 0) and actual["elev_m"] > FLAT_SESSION_VERT_CAP_M:
+        flat_mismatch = True
+        reasons.append(
+            f"TERRAIN MISMATCH: plan prescribed a flat/low-vert session (0m target) but you climbed "
+            f"+{actual['elev_m']:.0f}m -- not the intended stimulus."
+        )
+
+    only_duration_overshoot = (dist_ratio is None or dist_ratio <= FLAG_OVERSHOOT_RATIO) and \
+                               dur_ratio is not None and dur_ratio > FLAG_OVERSHOOT_RATIO
+    if only_duration_overshoot:
+        reasons.append(
+            f"DURATION OVERSHOOT: {fmt_duration(actual['dur_min'])} vs {fmt_duration(plan['target_duration_min'])} prescribed "
+            f"(+{(dur_ratio - 1) * 100:.0f}%)."
+        )
+
+    # Structured/interval sessions get assessed on their WORK reps (isolated
+    # from warm-up/recovery/cool-down via lap data), never on the
+    # whole-activity average -- see assess_interval_effort for why. Every
+    # other session_type keeps the original whole-activity-average path,
+    # which is correct for steady efforts (easy_trail, long_run, etc).
+    if plan["session_type"] in INTERVAL_SESSION_TYPES:
+        if garmin_client is not None and activity_id is not None:
+            # Belt-and-suspenders, matching this file's existing convention (BQ save,
+            # BQ history read, plan queries are all try/except-guarded the same way):
+            # fetch_activity_laps() only guards the network call itself. Garmin's lap
+            # JSON is external, variable-shape data we don't fully control -- a field
+            # this function doesn't yet know to null-guard should degrade this ONE
+            # verdict to UNCONFIRMED, not take down the whole day's email via the
+            # entry point's outer catch-all.
+            try:
+                intensity_verdict, intensity_explanation = assess_interval_effort(
+                    plan, activity_id, garmin_client
+                )
+            except Exception as e:
+                print(f"assess_interval_effort failed for activity {activity_id}: {e}")
+                intensity_verdict, intensity_explanation = "UNCONFIRMED", (
+                    "This is a structured interval session, but lap-based intensity assessment "
+                    "hit an unexpected error processing the data. Intensity on the work reps "
+                    "could not be confirmed this time."
+                )
+        else:
+            intensity_verdict, intensity_explanation = "UNCONFIRMED", (
+                "This is a structured interval session, but no activity ID / Garmin client was "
+                "available to fetch lap data for it. Whole-activity average HR is not a valid "
+                "substitute -- intensity on the work reps could not be confirmed this time."
+            )
+    else:
+        intensity_verdict, intensity_explanation = assess_effort_intensity(
+            plan, actual.get("avg_hr")
+        )
+
+    structural_issue = severe_short or dist_major_overshoot or vert_major_overshoot or vert_severe_short
+    partial_issue = partial_short or dist_flag_overshoot or vert_flag_overshoot or vert_partial_short or \
+                    only_duration_overshoot or flat_mismatch or \
+                    intensity_verdict in ("TOO HARD", "TOO EASY", "NOT HARD ENOUGH")
+
+    if structural_issue:
+        verdict = "OFF PLAN"
+    elif partial_issue:
+        verdict = "PARTIAL"
+    else:
+        verdict = "ON PLAN"
+
+    return {
+        "verdict": verdict,
+        "reasons": reasons,
+        "intensity_verdict": intensity_verdict,
+        "intensity_explanation": intensity_explanation,
+    }
+
+
 # ── Training history ─────────────────────────────────────────────────────────
 
 def get_training_history(weeks=4):
+    # weeks is always an internal constant (never derived from request input),
+    # but cast defensively since it's interpolated into an INTERVAL literal --
+    # BQ query params can't bind inside INTERVAL N DAY, so this is the guard.
+    weeks = int(weeks)
     client = get_bq_client()
     q = f"""
     SELECT activity_name, activity_type, start_time, distance_km, duration_min,
@@ -606,7 +1149,7 @@ def get_recent_activities(client, days=3):
     cutoff = datetime.today() - timedelta(days=days)
     recent = []
     for a in activities:
-        dt_str = a.get("startTimeLocal", "")[:19]
+        dt_str = (a.get("startTimeLocal") or "")[:19]
         try:
             dt = datetime.fromisoformat(dt_str)
             if dt >= cutoff:
@@ -618,12 +1161,48 @@ def get_recent_activities(client, days=3):
 # ── Main analysis (plan-aware) ───────────────────────────────────────────────
 
 def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
-                               week_progress, phase_status, training_context):
-    """Build the full plan-aware feedback email."""
-    name      = a.get("activityName", "Unnamed")
-    dt_str    = a.get("startTimeLocal", "")[:19]
+                               week_progress, phase_status, training_context,
+                               activity_date=None, today_plan=None, garmin_client=None):
+    """Build the full plan-aware feedback email.
+
+    IMPORTANT: `plan` here must be the plan for the ACTIVITY's own date
+    (`activity_date`), NOT necessarily today's plan -- the caller resolves
+    that. A `days=2` activity lookback can surface yesterday's run on a day
+    when today itself is prescribed rest; scoring that activity against
+    today's plan produced confidently wrong verdicts ("you ran on a rest
+    day" when the run was actually yesterday, correctly taken). When
+    `activity_date != today_date`, `today_plan` (today's actual plan) is
+    used to render a separate "Today" section so today's real status is
+    never silently dropped or misrepresented.
+
+    `garmin_client` is the already-authenticated Garmin client from
+    load_garmin_client() -- threaded through to assess_adherence() so
+    INTERVAL_SESSION_TYPES sessions can fetch lap data (assess_interval_effort).
+    Optional only for test/manual invocation; the real entry point
+    (garmin_daily_feedback) always passes it.
+    """
+    # activityName is free text settable by the device / Connect app / any
+    # authorised Connect IQ or partner app -- escape before it ever enters
+    # an f-string that markdown_to_html renders as raw HTML (Gmail strips
+    # <script> but not <img>/<a>, so an unescaped crafted name could still
+    # land a tracking pixel or phishing link).
+    # `.get(key, default)` only substitutes on a MISSING key -- an explicit
+    # `"activityName": null` from the API returns None, and html.escape(None)
+    # raises (old code harmlessly rendered "None"). Use `or` instead.
+    # Newline-strip is a log-injection guard: html.escape() does not touch
+    # \n/\r, so an embedded newline in a Garmin-supplied name could still
+    # forge adjacent lines in `print(feedback)` (Cloud Logging).
+    name      = html.escape((a.get("activityName") or "Unnamed").replace("\n", " ").replace("\r", " "))
+    dt_str    = (a.get("startTimeLocal") or "")[:19]
     dt        = datetime.fromisoformat(dt_str)
-    act_type  = a.get("activityType", {}).get("typeKey", "running")
+    if activity_date is None:
+        activity_date = dt.date()
+    same_day = activity_date == today_date
+        # Same None-unsafe pattern as activityName/startTimeLocal above:
+    # a.get("activityType", {}) only substitutes on a MISSING key --
+    # an explicit "activityType": null would return None, not {},
+    # and .get() on None raises. `or {}` covers both cases.
+    act_type  = (a.get("activityType") or {}).get("typeKey", "running")
     dist_km   = round((a.get("distance") or 0) / 1000, 2)
     dur_min   = round((a.get("duration") or 0) / 60, 1)
     elev_m    = round(a.get("elevationGain") or 0, 0)
@@ -640,15 +1219,23 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
 
     lines = []
 
-    # ── Header ──
-    week_num = plan["week_number"] if plan else "?"
-    phase = plan["phase"] if plan else "Pre-plan"
-    lines.append(f"# Daily Training Feedback -- {dt.strftime('%A %d %B %Y')}")
-    lines.append(f"*Week {week_num} of 13 | {phase} | **{days_to_race} days to Otter***")
+    # ── Header ── (always TODAY's date -- matches the email subject line;
+    # the activity's own date, if different, is called out explicitly below)
+    week_num = plan["week_number"] if (plan and same_day) else (today_plan["week_number"] if today_plan else "?")
+    phase = plan["phase"] if (plan and same_day) else (today_plan["phase"] if today_plan else "Pre-plan")
+    total_weeks = get_total_weeks() or "?"
+    lines.append(f"# Daily Training Feedback -- {today_date.strftime('%A %d %B %Y')}")
+    lines.append(f"*Week {week_num} of {total_weeks} | {phase} | **{days_to_race} days to UTCT PT55***")
     lines.append("")
 
     # ── Plan vs Actual ──
-    lines.append("## Today: Plan vs Actual")
+    # `plan` is keyed to the ACTIVITY's own date (activity_date), which may
+    # not be today. Label the section accordingly so it's never ambiguous
+    # which day is being assessed.
+    if same_day:
+        lines.append("## Today: Plan vs Actual")
+    else:
+        lines.append(f"## Most Recent Session -- {activity_date.strftime('%A %d %B')} (not today)")
     if plan:
         p_km = f"{plan['target_km']:.0f} km" if plan['target_km'] else "N/A"
         p_vert = f"{plan['target_vert_m']:.0f}m vert" if plan['target_vert_m'] else "N/A"
@@ -656,27 +1243,61 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
         p_rpe = plan['target_rpe'] or "N/A"
         lines.append(f"PLANNED: {plan['session_name']}, {p_km}, {p_vert}, {p_zone}, RPE {p_rpe}")
     else:
-        lines.append("PLANNED: No plan for today (outside plan dates)")
+        day_desc = "today" if same_day else activity_date.isoformat()
+        lines.append(f"PLANNED: No plan for {day_desc} (outside plan dates)")
 
     lines.append(f"DONE: {name}, {dist_km} km, +{elev_m:.0f}m vert, avg HR {avg_hr:.0f} ({actual_zone})" if avg_hr else f"DONE: {name}, {dist_km} km, +{elev_m:.0f}m vert")
 
-    # ── Effort verdict ──
-    if plan and plan["session_type"] not in ("rest", "strength"):
-        verdict, explanation = assess_effort_intensity(plan, avg_hr, max_hr_act)
-        if verdict:
-            lines.append(f"EFFORT VERDICT: {verdict}")
-            if explanation:
-                lines.append(explanation)
-    elif plan and plan["session_type"] == "rest":
-        lines.append(f"EFFORT VERDICT: Today was a REST day. You ran anyway. Was this a planned swap? If so, make sure you take the rest day elsewhere this week.")
+    # ── Adherence verdict (plan vs actual -- not just HR) ──
+    day_word = "today" if same_day else "that day"
+    if plan and plan["session_type"] == "rest":
+        lines.append(f"ADHERENCE VERDICT: OFF PLAN -- {day_word} was a REST day and you ran anyway. "
+                      "Was this a deliberate swap? If so, take the rest day elsewhere this week -- "
+                      "it does not just disappear.")
     elif plan and plan["session_type"] == "strength":
-        lines.append(f"EFFORT VERDICT: Today was a STRENGTH day in the plan. The run is bonus volume -- make sure you still do the strength work.")
+        lines.append(f"ADHERENCE VERDICT: PARTIAL -- {day_word} was a STRENGTH day. The run is bonus volume, "
+                      "not a substitute. Garmin cannot confirm whether the prescribed strength session "
+                      "was also done -- if it was not, that week is short a session.")
+    elif plan:
+        adherence = assess_adherence(plan, {
+            "act_type": act_type, "name": name, "dist_km": dist_km, "dur_min": dur_min,
+            "elev_m": elev_m, "avg_hr": avg_hr, "max_hr": max_hr_act,
+        }, garmin_client=garmin_client, activity_id=a.get("activityId"))
+        if adherence["verdict"]:
+            lines.append(f"ADHERENCE VERDICT: {adherence['verdict']}")
+            for reason in adherence["reasons"]:
+                lines.append(f"- {reason}")
+            if adherence["intensity_verdict"]:
+                lines.append(f"Effort intensity: {adherence['intensity_verdict']} -- {adherence['intensity_explanation']}")
+    else:
+        lines.append(f"ADHERENCE VERDICT: No prescribed session {day_word} (outside plan dates) -- nothing to compare against.")
     lines.append("")
+
+    # ── Today, if the most recent activity wasn't from today ──
+    # Keeps today's actual status visible instead of letting it disappear
+    # behind an older session's writeup (no silent/blank email).
+    if not same_day:
+        lines.append(f"## Today -- {today_date.strftime('%A %d %B')}")
+        if today_plan:
+            if today_plan["session_type"] == "rest":
+                lines.append(f"PLANNED: {today_plan['session_name']} -- {today_plan['description']}")
+            elif today_plan["session_type"] == "strength":
+                lines.append(f"PLANNED: {today_plan['session_name']} (strength sessions do not show up in Garmin data)")
+            else:
+                t_km = f"{today_plan['target_km']:.0f} km" if today_plan['target_km'] else "N/A"
+                t_vert = f"{today_plan['target_vert_m']:.0f}m vert" if today_plan['target_vert_m'] else "N/A"
+                lines.append(f"PLANNED: {today_plan['session_name']}, {t_km}, {t_vert}, RPE {today_plan['target_rpe']}")
+        else:
+            lines.append("No plan for today (outside plan dates).")
+        lines.append(f"DONE: No activity recorded for today -- the session above is from {activity_date.strftime('%A %d %B')}.")
+        lines.append("")
 
     # ── Session Analysis ──
     lines.append("## Session Analysis")
     lines.append(f"**{name}**")
-    lines.append(f"- Type: {act_type.replace('_', ' ').title()}")
+    # act_type is kept raw above for internal category matching
+    # (_activity_category / assess_adherence); escape only at display.
+    lines.append(f"- Type: {html.escape(act_type.replace('_', ' ').title())}")
     lines.append(f"- Distance: {dist_km} km | Duration: {fmt_duration(dur_min)}")
     lines.append(f"- Elevation: +{elev_m:.0f}m ({m_per_km}m/km)")
     lines.append(f"- Avg pace: {fmt_pace(avg_pace)}")
@@ -749,7 +1370,7 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
 
     # ── Recovery Prescription (plan-aware) ──
     lines.append("## Recovery Prescription")
-    if plan and plan["session_type"] in ("vo2max", "prologue_sim", "race_sim", "threshold"):
+    if plan and plan["session_type"] in ("vo2max", "threshold"):
         lines.append("- **Tonight**: 8-9hrs sleep. Non-negotiable after this intensity.")
         lines.append("- **Nutrition**: 1.6-2.0g protein/kg bodyweight. Carb refuel within 30min.")
         lines.append("- **Tomorrow**: Follow the plan. If it prescribes rest, honour it.")
@@ -773,9 +1394,9 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
 
     # ── Race Countdown ──
     lines.append("## Race Countdown")
-    lines.append(f"**{days_to_race} days to the Otter African Trail Run.**")
+    lines.append(f"**{days_to_race} days to UTCT PT55 (Llandudno -> Gardens RC, 56.7km, +2644m).**")
     if days_to_race > 60:
-        lines.append(f"Building the foundation. Consistency now pays dividends in September.")
+        lines.append(f"Building the foundation. Consistency now pays dividends in November.")
     elif days_to_race > 30:
         lines.append(f"Deep in the work. Every quality session is a deposit into race-day fitness.")
     elif days_to_race > 14:
@@ -785,7 +1406,7 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
     elif days_to_race > 1:
         lines.append(f"Race week. Trust the work. You are ready.")
     else:
-        lines.append(f"Race day. Leave nothing. The Otter rewards preparation.")
+        lines.append(f"Race day. Leave nothing. PT55 rewards preparation, not heroics on Suther Peak.")
     lines.append("")
 
     # ── Quote ──
@@ -813,9 +1434,10 @@ def build_rest_day_feedback(today_date, last_activity_date, plan, tomorrow_plan,
     week_num = plan["week_number"] if plan else "?"
     phase = plan["phase"] if plan else "Pre-plan"
 
+    total_weeks = get_total_weeks() or "?"
     lines = []
     lines.append(f"# Daily Training Feedback -- {today_date.strftime('%A %d %B %Y')}")
-    lines.append(f"*Week {week_num} of 13 | {phase} | **{days_to_race} days to Otter***")
+    lines.append(f"*Week {week_num} of {total_weeks} | {phase} | **{days_to_race} days to UTCT PT55***")
     lines.append("")
 
     # ── Plan vs Actual ──
@@ -824,11 +1446,12 @@ def build_rest_day_feedback(today_date, last_activity_date, plan, tomorrow_plan,
         if plan["session_type"] == "rest":
             lines.append(f"PLANNED: {plan['session_name']} -- {plan['description']}")
             lines.append(f"DONE: No activity recorded")
-            lines.append(f"EFFORT VERDICT: NAILED IT -- rest was prescribed. {plan['effort_description']}")
+            lines.append(f"ADHERENCE VERDICT: ON PLAN -- rest was prescribed and rest was taken. {plan['effort_description']}")
         elif plan["session_type"] == "strength":
             lines.append(f"PLANNED: {plan['session_name']}")
             lines.append(f"DONE: No Garmin activity recorded")
-            lines.append(f"Did you do the strength session? It will not appear in Garmin data.")
+            lines.append(f"ADHERENCE VERDICT: UNCONFIRMED -- strength sessions do not show up in Garmin. "
+                          f"If it was not done, log it manually; otherwise this week is quietly short a session.")
             lines.append(f"Reminder: {plan['description']}")
             lines.append(f"Effort target: RPE {plan['target_rpe']} -- \"{plan['effort_description']}\"")
         else:
@@ -838,12 +1461,13 @@ def build_rest_day_feedback(today_date, last_activity_date, plan, tomorrow_plan,
             lines.append(f"DONE: Nothing recorded")
             is_key = plan.get("is_key_session", False)
             if is_key:
-                lines.append(f"MISSED SESSION -- this was a KEY SESSION. {plan['session_name']} is one of the two critical sessions this week (quality Wednesday + long Sunday). Missing it creates a gap in your preparation that is hard to recover from. Can you reschedule within 48 hours?")
+                lines.append(f"ADHERENCE VERDICT: MISSED -- this was a KEY SESSION. {plan['session_name']} is one of the critical sessions this week. Missing it creates a gap in your preparation that is hard to recover from. Can you reschedule within 48 hours?")
             else:
-                lines.append(f"MISSED SESSION -- {plan['session_name']} was on the plan today. Life happens, but track the impact on your weekly targets below.")
+                lines.append(f"ADHERENCE VERDICT: MISSED -- {plan['session_name']} was on the plan today. Life happens, but it still counts against the weekly targets below.")
     else:
         lines.append("No plan for today.")
         lines.append("DONE: No activity recorded")
+        lines.append("ADHERENCE VERDICT: No prescribed session today -- nothing to compare against.")
     lines.append("")
 
     # ── Days since last session ──
@@ -909,7 +1533,7 @@ def build_rest_day_feedback(today_date, last_activity_date, plan, tomorrow_plan,
 
     # ── Race Countdown ──
     lines.append("## Race Countdown")
-    lines.append(f"**{days_to_race} days to the Otter African Trail Run.**")
+    lines.append(f"**{days_to_race} days to UTCT PT55.**")
     if plan and plan["session_type"] == "rest":
         lines.append("Rest is part of the plan. Adaptation happens during recovery, not during training.")
     elif plan and plan["session_type"] not in ("rest", "strength"):
@@ -962,7 +1586,7 @@ def garmin_daily_feedback(request):
             last_date = None
             if all_acts:
                 try:
-                    last_date = datetime.fromisoformat(all_acts[0].get("startTimeLocal","")[:19]).date()
+                    last_date = datetime.fromisoformat((all_acts[0].get("startTimeLocal") or "")[:19]).date()
                 except:
                     pass
             feedback = build_rest_day_feedback(
@@ -971,22 +1595,57 @@ def garmin_daily_feedback(request):
             )
         else:
             # Activity found -- full analysis
-            latest = sorted(recent, key=lambda x: x.get("startTimeLocal",""), reverse=True)[0]
+            latest = sorted(recent, key=lambda x: x.get("startTimeLocal") or "", reverse=True)[0]
             all_recent_3d = get_recent_activities(client, days=3)
+
+            # Key the adherence comparison to the ACTIVITY's own date, not
+            # today's. get_recent_activities(days=2) can surface yesterday's
+            # session on a day when today itself is prescribed rest -- scoring
+            # it against today's plan produced confidently wrong verdicts
+            # ("you ran on a rest day" for a run that was actually yesterday
+            # and correctly taken). `plan` (today's) is passed through
+            # separately as today_plan so today's real status still shows.
+            try:
+                activity_date = datetime.fromisoformat((latest.get("startTimeLocal") or "")[:19]).date()
+            except Exception:
+                activity_date = today_date
+            if activity_date == today_date:
+                activity_plan = plan
+            else:
+                try:
+                    activity_plan = get_todays_plan(activity_date)
+                except Exception as e:
+                    print(f"Activity-date plan query failed: {e}")
+                    activity_plan = None
+
             feedback = build_plan_aware_feedback(
-                latest, all_recent_3d, today_date, plan, tomorrow_plan,
-                week_progress, phase_status, training_context
+                latest, all_recent_3d, today_date, activity_plan, tomorrow_plan,
+                week_progress, phase_status, training_context,
+                activity_date=activity_date, today_plan=plan, garmin_client=client
             )
 
         save_tokens_if_refreshed()
 
         today_label = datetime.today().strftime("%a %d %b")
         subject = f"Training Feedback -- {today_label}"
-        send_email(subject, feedback)
+        email_sent = send_email(subject, feedback)
 
         print(feedback)
+        if not email_sent:
+            # Non-200 makes the failure visible in Cloud Logging / the
+            # function's own error metrics instead of a silently-dropped
+            # email reading as success (was: swallowed exception +
+            # unconditional 200). NOTE: garmin-daily-feedback-7am's retryCount
+            # is pinned to 0 (see A3 / 2026-08-25 memory entry) -- Scheduler
+            # will NOT retry this; a genuine failure just waits for tomorrow's
+            # scheduled run.
+            return ("Email send failed -- see function logs", 502)
         return ("OK", 200)
 
     except Exception as e:
         print(f"Fatal error: {e}")
-        return (f"Error: {e}", 500)
+        # Raw exception text stays server-side only (Cloud Logging) -- the
+        # HTTP response is generic so internal details (stack traces, BQ/
+        # secret resource names, etc.) never leak to whatever can reach
+        # this endpoint. Consistent with the 502 pattern above.
+        return ("Internal error, see logs", 500)
