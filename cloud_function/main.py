@@ -646,7 +646,18 @@ def assess_interval_effort(plan, activity_id, garmin_client):
     session_type = plan["session_type"]
     hr_target = SESSION_HR_TARGETS.get(session_type)
     if not hr_target:
-        return None, None
+        # Every sibling early-return in this function yields UNCONFIRMED, not a bare
+        # (None, None) -- a silent None verdict is exactly the failure mode this whole
+        # feature exists to close off (Rune IMPORTANT, 2026-09-16): the caller's
+        # `if adherence["intensity_verdict"]:` check would just omit the "Effort
+        # intensity:" line entirely rather than surfacing that something is wrong.
+        # Unreachable today (SESSION_HR_TARGETS and INTERVAL_SESSION_TYPES agree on all
+        # four types) -- kept as a structural guard against future drift between them.
+        return "UNCONFIRMED", (
+            f"No HR target is configured for session_type '{session_type}' -- intensity on "
+            "the work reps could not be judged without one. This indicates a config gap "
+            "(SESSION_HR_TARGETS / INTERVAL_SESSION_TYPES out of sync), not a data problem."
+        )
 
     laps = fetch_activity_laps(garmin_client, activity_id)
     if len(laps) < 3:
@@ -681,6 +692,23 @@ def assess_interval_effort(plan, activity_id, garmin_client):
         )
 
     structure = _parse_session_structure(plan.get("description"))
+    # CRITICAL (Rune, 2026-09-16): rep_minutes=None (unparseable plan description --
+    # confirmed live on 4/28 current interval-type rows, e.g. "4x90sec" using seconds
+    # not "min", or a hill_repeats description with no numeric rep duration at all)
+    # previously fell through to `if rep_minutes and rep_minutes <= 4:` being FALSE,
+    # silently routing into the long-rep/whole-work-average branch below -- which is
+    # the exact whole-activity-style averaging this feature exists to avoid for short
+    # reps. Fail safe and explicit instead of picking a method by accident.
+    if structure["rep_minutes"] is None:
+        return "UNCONFIRMED", (
+            "This is a structured interval session, but the prescribed rep duration could "
+            "not be parsed from the plan description (expected a pattern like 'Nx Ymin' or "
+            "'Nx hill reps, ~Ymin'). Without it there's no safe way to choose between the "
+            "short-rep (max-HR) and long-rep (average-HR) judging method -- intensity on "
+            "the work reps could not be confirmed this time. Check the plan description's "
+            "structure text for this session."
+        )
+
     interior = list(laps)
     # Same NULL guard as above -- direct `["distance"]` indexing would KeyError on a
     # missing field and a bare `/1000` would TypeError on an explicit `None`; either
@@ -715,13 +743,21 @@ def assess_interval_effort(plan, activity_id, garmin_client):
     work_max_hr = max(l.get("maxHR") or 0 for l in work)
     rep_hrs = [l["averageHR"] for l in work]  # chronological -- laps come back in activity order
 
+    # `significant_fade` is a VERDICT input, not just narrative (Rune IMPORTANT,
+    # 2026-09-16): the fade check used to compute a genuine "you didn't hold it"
+    # signal and then only mention it in prose, leaving verdict selection to ignore
+    # it entirely -- so an email could read "NAILED IT" immediately followed by
+    # "you did not hold the target through to the end of the set." Self-contradicting
+    # output is worse than a slightly more conservative verdict.
     fade_note = ""
+    significant_fade = False
     if len(rep_hrs) >= 4:
         half = len(rep_hrs) // 2
         first_half_avg = sum(rep_hrs[:half]) / half
         second_half_avg = sum(rep_hrs[half:]) / (len(rep_hrs) - half)
         drop = first_half_avg - second_half_avg
         if drop >= 5:
+            significant_fade = True
             fade_note = (f" Reps faded across the set: first half averaged {first_half_avg:.0f} bpm, "
                          f"second half {second_half_avg:.0f} bpm ({drop:.0f} bpm drop) -- you did not "
                          f"hold the target through to the end of the set.")
@@ -741,18 +777,40 @@ def assess_interval_effort(plan, activity_id, garmin_client):
     # Longer reps (threshold-style, ~6min+) give HR time to settle, so
     # average-during-rep is treated as a fair signal there, same as before.
     if rep_minutes and rep_minutes <= 4:
-        if work_max_hr >= expected_min - 3:
+        # Majority rule (Rune IMPORTANT, 2026-09-16): the old check
+        # (`work_max_hr >= floor`) let ONE strong rep among several weak ones --
+        # or a single sensor glitch -- decide NAILED IT vs NOT HARD ENOUGH for the
+        # whole set. Require more than half the reps to individually reach the
+        # floor on their own max HR.
+        per_rep_max = [l.get("maxHR") or 0 for l in work]
+        reps_hit_target = sum(1 for m in per_rep_max if m >= expected_min - 3)
+        majority_hit = reps_hit_target > len(work) / 2
+
+        if majority_hit and not significant_fade:
             verdict = "NAILED IT"
             expl = (f"Work reps peaked at {work_max_hr:.0f} bpm (avg {work_avg_hr:.0f} bpm across "
-                    f"{len(work)} reps).{fade_note} On {rep_minutes}-min reps, HR does not have time to "
+                    f"{len(work)} reps, {reps_hit_target}/{len(work)} individually reaching the "
+                    f"{expected_min} bpm floor).{fade_note} On {rep_minutes}-min reps, HR does not have time to "
                     f"plateau at the target average before the rep ends -- max HR reached and consistency "
                     f"across reps are the honest read here, and both look good. "
                     f"The plan said: \"{plan.get('effort_description','')}\".")
+        elif majority_hit and significant_fade:
+            # Downgraded from NAILED IT, not just footnoted -- also feeds the
+            # existing OFF-PLAN/PARTIAL/ON-PLAN rollup below via the
+            # ("TOO HARD","TOO EASY","NOT HARD ENOUGH") membership check, same as
+            # every other non-NAILED-IT verdict.
+            verdict = "TOO EASY"
+            expl = (f"Work reps peaked at {work_max_hr:.0f} bpm (avg {work_avg_hr:.0f} bpm across "
+                    f"{len(work)} reps, {reps_hit_target}/{len(work)} individually reaching the "
+                    f"{expected_min} bpm floor) -- the early reps were hard enough, but you faded before "
+                    f"the end of the set.{fade_note} That's not the full stimulus this session "
+                    f"prescribed; hold the intensity to the last rep next time.")
         else:
             verdict = "NOT HARD ENOUGH"
-            expl = (f"Work reps only reached {work_max_hr:.0f} bpm max (avg {work_avg_hr:.0f} bpm across "
-                    f"{len(work)} reps) -- below the {expected_min} bpm floor even accounting for HR lag "
-                    f"on short reps.{fade_note} Push harder on the climbs next time.")
+            expl = (f"Only {reps_hit_target}/{len(work)} work reps reached the {expected_min} bpm floor "
+                    f"on their own max HR (overall peak {work_max_hr:.0f} bpm, avg {work_avg_hr:.0f} bpm "
+                    f"across {len(work)} reps) -- below target even accounting for HR lag on short reps."
+                    f"{fade_note} Push harder on the climbs next time.")
     else:
         if work_avg_hr < expected_min - 10:
             verdict = "NOT HARD ENOUGH"
@@ -766,6 +824,15 @@ def assess_interval_effort(plan, activity_id, garmin_client):
             verdict = "TOO HARD"
             expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- over the "
                     f"{expected_max} bpm ceiling.{fade_note}")
+        elif significant_fade:
+            # Same downgrade as the short-rep branch: the average lands in zone,
+            # but that average hides a real decline across the set -- NAILED IT
+            # would contradict the fade narrative that follows it.
+            verdict = "TOO EASY"
+            expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- in the "
+                    f"{expected_min}-{expected_max} bpm target zone overall, but that average hides a "
+                    f"real fade.{fade_note} Credit for starting strong, but this isn't a full NAILED IT "
+                    f"-- hold the intensity to the last rep next time.")
         else:
             verdict = "NAILED IT"
             expl = (f"Work reps averaged {work_avg_hr:.0f} bpm across {len(work)} reps -- right in the "
@@ -1259,10 +1326,19 @@ def build_plan_aware_feedback(a, all_recent, today_date, plan, tomorrow_plan,
                       "not a substitute. Garmin cannot confirm whether the prescribed strength session "
                       "was also done -- if it was not, that week is short a session.")
     elif plan:
+        # int-cast for consistency with save_session_to_bq's convention (Cyrus MINOR,
+        # 2026-09-16) -- garminconnect str()'s this internally either way, so this is
+        # tidiness, not a correctness fix; a bad/missing id just yields None, and
+        # fetch_activity_laps's own try/except turns that into UNCONFIRMED downstream.
+        _raw_activity_id = a.get("activityId")
+        try:
+            _lap_activity_id = int(_raw_activity_id) if _raw_activity_id is not None else None
+        except (TypeError, ValueError):
+            _lap_activity_id = None
         adherence = assess_adherence(plan, {
             "act_type": act_type, "name": name, "dist_km": dist_km, "dur_min": dur_min,
             "elev_m": elev_m, "avg_hr": avg_hr, "max_hr": max_hr_act,
-        }, garmin_client=garmin_client, activity_id=a.get("activityId"))
+        }, garmin_client=garmin_client, activity_id=_lap_activity_id)
         if adherence["verdict"]:
             lines.append(f"ADHERENCE VERDICT: {adherence['verdict']}")
             for reason in adherence["reasons"]:
