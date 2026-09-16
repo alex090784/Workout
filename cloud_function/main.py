@@ -604,7 +604,19 @@ def _parse_session_structure(description):
     free-text description. Every INTERVAL_SESSION_TYPES row seen so far
     follows 'Warm up Xkm. ... NxYmin ... Cool down Xkm.' (or 'Nx hill reps,
     ~Ymin climb'). Any field this can't find comes back None -- callers must
-    treat that as "unknown", never assume a default."""
+    treat that as "unknown", never assume a default.
+
+    `warmup_mentioned` / `cooldown_mentioned` (Rune IMPORTANT, 2026-09-16):
+    whether the literal phrase appears in the text AT ALL, independent of
+    whether a distance could be parsed from it. This distinguishes "no
+    warm-up/cool-down in this session" (nothing to strip, fine) from
+    "warm-up/cool-down exists but we don't know its length" (something IS
+    sitting in the lap data that must not silently stay in `interior` just
+    because the distance-based strip couldn't fire) -- confirmed live on 14
+    of 28 current interval-type training_plan rows: text reads "Cool down."
+    with no distance, e.g. "3x8min @ Z4 with 2min jog recovery. Cool down.
+    Raising threshold ahead of the specific block."
+    """
     d = description or ""
     wu = re.search(r'[Ww]arm[- ]?up\s+([\d.]+)\s*km', d)
     cd = re.search(r'[Cc]ool[- ]?down\s+([\d.]+)\s*km', d)
@@ -614,6 +626,8 @@ def _parse_session_structure(description):
         "cooldown_km": float(cd.group(1)) if cd else None,
         "rep_count":   int(rep.group(1)) if rep else None,
         "rep_minutes": int(rep.group(2)) if rep else None,
+        "warmup_mentioned":   bool(re.search(r'[Ww]arm[- ]?up', d)),
+        "cooldown_mentioned": bool(re.search(r'[Cc]ool[- ]?down', d)),
     }
 
 
@@ -709,6 +723,34 @@ def assess_interval_effort(plan, activity_id, garmin_client):
             "structure text for this session."
         )
 
+    # IMPORTANT (Rune, 2026-09-16): a mentioned-but-unparseable warm-up/cool-down is
+    # NOT the same as "there isn't one." The distance-gated strips below only fire
+    # when a km figure parsed; if the plan text says "Cool down." with no distance
+    # (confirmed live on 14/28 current rows -- rep_minutes parses fine on these, so
+    # they sailed past the CRITICAL check and were WRONGLY characterised as safe),
+    # the cool-down lap silently stays in `interior`, pulls `min(hrs)`/`midpoint`
+    # down (a cool-down runs cooler than a mid-set recovery jog), can cross genuine
+    # recovery laps into `work`, and -- worst case -- depresses the tail of
+    # `rep_hrs` into a false-positive `significant_fade` that downgrades a clean
+    # set with emphatic "you did not hold the target" language. No existing gate
+    # catches this; it proceeds straight to a confident, contaminated verdict.
+    # Fail safe instead of guessing which lap is the untimed warm-up/cool-down.
+    if structure["warmup_mentioned"] and not structure["warmup_km"]:
+        return "UNCONFIRMED", (
+            "This session's plan description mentions a warm-up but doesn't give its distance, "
+            "so the warm-up lap can't be safely separated from the work reps in the lap data -- "
+            "including it would contaminate the work-rep HR average. Intensity could not be "
+            "confirmed this time."
+        )
+    if structure["cooldown_mentioned"] and not structure["cooldown_km"]:
+        return "UNCONFIRMED", (
+            "This session's plan description mentions a cool-down but doesn't give its distance, "
+            "so the cool-down lap can't be safely separated from the work reps in the lap data -- "
+            "a cool-down typically reads cooler than a mid-set recovery jog and would pull the "
+            "work-rep HR average down (or trigger a false fade-based downgrade). Intensity could "
+            "not be confirmed this time."
+        )
+
     interior = list(laps)
     # Same NULL guard as above -- direct `["distance"]` indexing would KeyError on a
     # missing field and a bare `/1000` would TypeError on an explicit `None`; either
@@ -738,6 +780,23 @@ def assess_interval_effort(plan, activity_id, garmin_client):
 
     if not work:
         return "UNCONFIRMED", "Could not distinguish work reps from recovery in the lap data."
+
+    # IMPORTANT #2 (Rune, 2026-09-16): rep_count is parsed but was never checked
+    # against what the midpoint heuristic actually isolated. If isolation misfires
+    # (e.g. finds 1-2 laps when 6 were prescribed -- the exact failure mode the
+    # comment above already calls out as possible), the majority rule further down
+    # fires confidently on a degenerate denominator: a 1-rep "work" set reduces
+    # "majority" to a single pass/fail, with nothing flagging that the isolation
+    # itself was suspect. Tolerance chosen: +/-1 lap -- absorbs an ordinary
+    # lap-press timing quirk (one boundary merged or split) without masking a
+    # mismatch at the scale that actually indicates isolation failure.
+    rep_count = structure["rep_count"]
+    if rep_count is not None and abs(len(work) - rep_count) > 1:
+        return "UNCONFIRMED", (
+            f"The plan prescribed {rep_count} work reps, but lap-based isolation found "
+            f"{len(work)} -- too large a mismatch to trust the isolation. Rather than score a "
+            "mis-isolated subset of the reps, intensity could not be confirmed this time."
+        )
 
     work_avg_hr = sum(l["averageHR"] for l in work) / len(work)
     work_max_hr = max(l.get("maxHR") or 0 for l in work)
