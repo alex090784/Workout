@@ -233,6 +233,27 @@ INTERVAL_SESSION_TYPES = {"vo2max", "threshold", "hill_repeats", "sharpener"}
 # this session_type, not just no downgrade).
 FADE_EXCLUDED_SESSION_TYPES = {"sharpener"}
 
+# Decoupling significance threshold, as a % rise in the HR/output efficiency
+# ratio from first-half to second-half of the work reps. Aria's calibration,
+# 2026-09-16 round 2 (see domain_aria_fitness.md) -- her regression of the real
+# 2026-09-16 VO2max lap data found ~10% natural rep-to-rep noise in distance
+# covered even on a genuinely fade-free session; the original 10% threshold
+# sat inside that noise floor. 20% gives real margin. Flat across
+# threshold/vo2max/hill_repeats -- settled, not to be relitigated without new
+# evidence.
+DECOUPLING_THRESHOLD_PCT = 20
+
+# Fallback vertical-equivalent factor for the output term, used ONLY when
+# Garmin's own per-lap `avgGradeAdjustedSpeed` is unavailable for a session
+# (see assess_interval_effort). Aria's calibration, 2026-09-16 round 2: a
+# regression of 85 of Alexis's own trail sessions found the true
+# cost-of-climbing curve is convex, not linear -- ~5-6x on moderate/rolling
+# terrain (threshold reps), ~12-13x on steep terrain (vo2max/hill_repeats
+# reps, e.g. Platteklip Gorge/Kloof Nek). A SPLIT constant, not a single
+# uniform value -- deliberately, so the next person doesn't collapse this back
+# into one number. `sharpener` omitted: excluded from fade entirely upstream.
+GRADE_FACTOR_FALLBACK = {"threshold": 6, "vo2max": 12, "hill_repeats": 12}
+
 def _plan_category(session_type):
     if session_type in BIKE_SESSION_TYPES: return "bike"
     if session_type in RUN_SESSION_TYPES: return "run"
@@ -704,12 +725,34 @@ def assess_interval_effort(plan, activity_id, garmin_client):
     interior_dists = [l.get("distance") or 0 for l in laps[:-1]]
     autolap_uniform = len(interior_dists) >= 3 and (max(interior_dists) - min(interior_dists)) < 50
 
-    if not structured or autolap_uniform:
+    # `structured` (from Garmin's own intensityType) is the AUTHORITATIVE signal --
+    # `autolap_uniform` is a fallback heuristic that exists specifically to catch
+    # the case where intensityType ISN'T reliable (a free run with plain GPS
+    # auto-lap, which always reads 'ACTIVE'). ORing them let the fallback veto the
+    # authoritative signal (Rune IMPORTANT, 2026-09-16 close-out): a well-paced
+    # session with consistent rep distances -- i.e. good execution -- where
+    # recovery jogs happen to land within ~50m of the work reps got flagged as
+    # "looks like auto-lap" and silently UNCONFIRMED despite intensityType
+    # correctly confirming a real structured workout with genuine rep boundaries.
+    # That's the inverted failure mode this whole feature exists to avoid:
+    # rewarding good execution with silence. Fixed: autolap_uniform is now only
+    # consulted when `structured` is False -- i.e. only as a fallback for the
+    # specific case its own comment above describes, never as a veto over a
+    # metadata-confirmed structured workout.
+    if not structured and autolap_uniform:
         return "UNCONFIRMED", (
             "Lap data on this activity looks like default GPS auto-lap (even splits), not the "
             "structured interval workout the plan prescribed -- there's no way to separate work reps "
             "from recovery in this data. Load the course/structured workout on the watch for this "
             "session type; until then, intensity on the work reps can't be confirmed."
+        )
+    if not structured:
+        return "UNCONFIRMED", (
+            "Lap data on this activity doesn't carry the structured-workout intensity metadata "
+            "(intensityType) that marks a real course-loaded interval session, and lap distances "
+            "aren't uniform enough to identify it as plain auto-lap either -- there's no reliable "
+            "way to separate work reps from recovery in this data. Intensity on the work reps "
+            "could not be confirmed this time."
         )
 
     structure = _parse_session_structure(plan.get("description"))
@@ -846,30 +889,60 @@ def assess_interval_effort(plan, activity_id, garmin_client):
         )
         if terrain_consistent:
             # (3) Efficiency ratio = HR / grade-adjusted output, not raw HR.
-            # Output term chosen: distance PLUS a vertical-gain equivalent,
-            # divided by duration ("grade-adjusted effective speed") -- not
-            # plain pace, deliberately: for hill reps a pace-only denominator
-            # is itself confounded by WHERE on the climb a given rep sits
-            # (steeper section = slower pace at the same effort), so distance
-            # alone can't tell "went slower" apart from "climbed a harder
-            # bit." VERT_EQUIV_FACTOR=8 is a mid-range value from the
-            # commonly-cited ~7-10x horizontal-equivalent energy cost of a
-            # vertical metre in trail running -- it only has to be internally
-            # consistent for a same-session first-half-vs-second-half
-            # comparison, not physiologically exact, so 7 vs 10 doesn't
-            # change the conclusion here.
-            VERT_EQUIV_FACTOR = 8
+            #
+            # Output term (Aria's calibration, 2026-09-16, round 2): a constant
+            # vertical-equivalent factor is wrong because the true cost-of-climbing
+            # curve is CONVEX, not linear -- her regression of 85 of Alexis's own
+            # trail sessions (matched HR band; whole-session aggregates as a proxy,
+            # her own caveat: direction/magnitude sound, exact figures not precise)
+            # found ~5-6x on moderate/rolling terrain (where threshold reps happen)
+            # rising to ~12-13x on steep terrain like Platteklip Gorge/Kloof Nek
+            # (where vo2max/hill_repeats reps happen). A single constant
+            # over-penalises rolling terrain and under-penalises steep climbs --
+            # backwards for exactly the sessions that matter most.
+            #
+            # PRIMARY: Garmin's own per-lap `avgGradeAdjustedSpeed` -- confirmed
+            # present and populated live (31/31 laps across 2 real activities
+            # checked 2026-09-16, field name and non-null/non-zero values
+            # verified directly, not assumed). It captures the nonlinearity
+            # natively and removes the constant-picking problem entirely; used
+            # directly as the output term (it's already a speed, no division needed).
+            #
+            # FALLBACK: only if avgGradeAdjustedSpeed is missing/null/zero on ANY
+            # work rep -- never mix methods within one comparison (one lap on GAS,
+            # another on the constant formula would make the ratio meaningless).
+            # Falls back to a SPLIT constant (her figures, not a uniform value):
+            # GRADE_FACTOR_FALLBACK below, keyed by session_type.
+            def _rep_output_gas(l):
+                gas = l.get("avgGradeAdjustedSpeed")
+                return gas if gas and gas > 0 else None
 
-            def _rep_output(l):
+            def _rep_output_fallback(l, factor):
                 dist = l.get("distance") or 0
                 elev = l.get("elevationGain") or 0
                 dur = l.get("duration") or 0
                 if dur <= 0:
                     return None
-                return (dist + VERT_EQUIV_FACTOR * elev) / dur  # effective m/s
+                return (dist + factor * elev) / dur  # effective m/s
 
-            outputs = [_rep_output(l) for l in work]
-            if all(o is not None and o > 0 for o in outputs):
+            gas_outputs = [_rep_output_gas(l) for l in work]
+            method = None
+            outputs = None
+            if all(o is not None for o in gas_outputs):
+                outputs = gas_outputs
+                method = "Garmin's grade-adjusted speed"
+            else:
+                factor = GRADE_FACTOR_FALLBACK.get(session_type)
+                if factor is not None:
+                    fb_outputs = [_rep_output_fallback(l, factor) for l in work]
+                    if all(o is not None and o > 0 for o in fb_outputs):
+                        outputs = fb_outputs
+                        method = f"a {factor}x vertical-equivalent estimate (Garmin's own grade-adjusted speed wasn't available for this activity)"
+                # else: no fallback factor defined for this session_type, or the
+                # fallback itself couldn't compute (missing distance/duration) --
+                # outputs stays None, fade_note stays "", omitted rather than guessed.
+
+            if outputs is not None:
                 # HR / output: a RISING ratio means more heartbeats per unit of
                 # work done as the set goes on -- decoupling. A flat or falling
                 # ratio means efficiency held even if raw HR happened to drop
@@ -890,29 +963,30 @@ def assess_interval_effort(plan, activity_id, garmin_client):
                 second_half_hr = sum(rep_hrs[half:]) / (len(rep_hrs) - half)
                 hr_not_falling = second_half_hr >= first_half_hr - 2
 
-                # (2) Threshold mapped onto the new ratio-based metric: a raw-bpm
-                # trigger doesn't transfer to a unitless ratio, so this is judgement,
-                # not derivation -- picked 10% ratio rise as the significance bar,
-                # consistent with the common endurance-coaching convention that
-                # flags >5-10% Pace:HR / Power:HR decoupling as a genuine
-                # aerobic-efficiency concern rather than noise (open to
-                # recalibration if Aria's coaching read disagrees once this has
-                # run against real sessions).
-                if ratio_rise_pct >= 10 and hr_not_falling:
+                # (2) Threshold (Aria's calibration, 2026-09-16, round 2): her
+                # regression of the REAL 2026-09-16 VO2max lap data found ~10%
+                # natural rep-to-rep noise in distance covered on fixed-duration
+                # reps even in a genuinely fade-free session -- the original 10%
+                # ratio-rise threshold sat INSIDE that noise floor and would fire
+                # on noise. Raised to 20% for real margin above it. Flat across
+                # threshold/vo2max/hill_repeats -- no per-type variation (sharpener
+                # is excluded from fade entirely, upstream of this block). Settled
+                # per her domain_aria_fitness.md write-up -- not to be relitigated
+                # without new evidence.
+                if ratio_rise_pct >= DECOUPLING_THRESHOLD_PCT and hr_not_falling:
                     significant_fade = True
                     fade_note = (
-                        f" Efficiency faded across the set: HR cost per unit of effort rose "
-                        f"{ratio_rise_pct:.0f}% from the first half to the second half (HR "
-                        f"{second_half_hr:.0f} bpm in the second half vs {first_half_hr:.0f} bpm in "
-                        f"the first, while output fell) -- you did not hold the target through to "
+                        f" Efficiency faded across the set (judged on {method}): HR cost per unit "
+                        f"of effort rose {ratio_rise_pct:.0f}% from the first half to the second half "
+                        f"(HR {second_half_hr:.0f} bpm in the second half vs {first_half_hr:.0f} bpm "
+                        f"in the first, while output fell) -- you did not hold the target through to "
                         f"the end of the set."
                     )
-                elif ratio_rise_pct <= -10:
-                    fade_note = " Efficiency held or improved across the set -- no fade."
+                elif ratio_rise_pct <= -DECOUPLING_THRESHOLD_PCT:
+                    fade_note = f" Efficiency held or improved across the set (judged on {method}) -- no fade."
                 else:
-                    fade_note = f" Efficiency held steady across all {len(work)} reps."
-                # else (missing duration/elevation on any rep): can't compute output --
-                # fade_note stays "", omitted rather than guessed.
+                    fade_note = f" Efficiency held steady across all {len(work)} reps (judged on {method})."
+                # else (no viable output method): fade_note stays "", omitted rather than guessed.
             # else (terrain inconsistent across reps): fade_note stays "", omitted.
         # else (sharpener, or <4 reps to compare halves): fade_note stays "", omitted.
 
