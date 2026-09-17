@@ -33,9 +33,13 @@ for t in "${TARGETS[@]}"; do
     if [ -f "$t" ]; then
         PRE_SHA=$(shasum -a 256 "$t" | awk '{print $1}')
         if [ "$PRE_SHA" != "$CANON_SHA" ]; then
-            echo "WARNING: $t DIFFERED from canonical before this run (sha256 $PRE_SHA)." >&2
-            echo "         If you hand-edited this file directly, that edit is now overwritten." >&2
-            echo "         Edit shared/session_parser.py instead -- it is the single source of truth." >&2
+            MSG="$(date -u +%Y-%m-%dT%H:%M:%SZ) DRIFT: $t differed from canonical (sha256 $PRE_SHA, canonical $CANON_SHA) -- overwritten. Edit shared/session_parser.py instead."
+            echo "WARNING: $MSG" >&2
+            # [Rune re-check MINOR] a terminal-only warning is only ever seen
+            # by whoever happens to be watching when this runs. Durable trace
+            # so a drift event is discoverable later, not just in that one
+            # terminal's scrollback.
+            echo "$MSG" >> "$(dirname "$0")/.parser_drift_log.txt"
         fi
     fi
     cp "$CANONICAL" "$t"

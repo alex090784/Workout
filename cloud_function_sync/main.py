@@ -109,6 +109,25 @@ CHECKPOINT_SINGLE_EFFORT = {"2027-03-12"}                   # 1x90min continuous
 
 REP_BPM_RE = re.compile(r'@\s*Z\d(?:-Z\d)?\s*\(([\d]+)-([\d]+)\)')
 
+# [RUNE re-check, CRITICAL-1 residual] Every event this job creates or
+# updates is stamped with a stable identity tag in intervals.icu's own
+# `external_id` field -- deliberately NOT a BQ-side id cache (that would
+# reintroduce exactly the "trust a remembered id" anti-pattern this whole
+# architecture was built to avoid; a BQ column mapping plan_date->event_id
+# could itself go stale independent of intervals.icu's actual state).
+# Instead the identity marker lives on the event itself and is re-read fresh
+# from intervals.icu on every run, same as everything else here. This is
+# what makes it possible to tell "the lone event on this date is ours,
+# safe to overwrite even though its name differs (a legitimate session-type
+# change from a restructure)" apart from "the lone event on this date was
+# never touched by this job (a manually-added personal entry, or a stale
+# pre-tagging survivor) -- do not touch it."
+SYNC_TAG_PREFIX = "training-plan-sync:"
+
+
+def sync_tag(plan_date):
+    return f"{SYNC_TAG_PREFIX}{plan_date}"
+
 # [RUNE-6, cheap second layer] log the canonical file's sha256 at cold start
 # so drift between this deploy directory's copy and the canonical
 # shared/session_parser.py is at least OBSERVABLE in logs even though the
@@ -259,33 +278,76 @@ def icu_update(auth, event_id, payload):
     return r.json()
 
 
-def resolve_existing_event(date_events, target_name):
-    """[RUNE-CRITICAL-1] Given every intervals.icu event currently on this
-    date (0, 1, or more) and the name we intend to write, decide which one
-    (if any) this BQ row corresponds to. Returns (existing_event_or_None,
-    anomaly_note_or_None). NEVER silently picks a winner among multiple
-    un-attributable events -- that was exactly the defect (row A diffs
-    against the wrong cached event, overwrites row B's content, row B then
-    reports SKIP against stale data)."""
+def resolve_existing_event(date_events, target_name, expected_tag):
+    """[RUNE-CRITICAL-1, re-check fix] Given every intervals.icu event
+    currently on this date (0, 1, or more), the name we intend to write, and
+    the identity tag this job stamps on everything it manages (see
+    sync_tag()), decide which one (if any) this BQ row corresponds to.
+    Returns (existing_event_or_None, anomaly_note_or_None). NEVER silently
+    picks a winner among multiple un-attributable events, and -- fixed here
+    -- NEVER silently accepts a single untagged event as a match either.
+
+    Rune's re-check finding: the previous version returned the lone event on
+    a date as *the* match unconditionally. That's correct for "session_type
+    changed on this date, same slot" (the case this whole redesign targets),
+    but wrong for "the lone event on this date isn't this job's event at
+    all" (a manually-added personal entry, or a stale pre-tagging survivor)
+    -- a name mismatch there would silently overwrite unrelated content, and
+    it would show up in the audit log as an ordinary UPDATE, indistinguishable
+    from a legitimate refresh. Trusting `external_id` instead of a name
+    heuristic solves this WITHOUT breaking the session-type-changed case,
+    because the tag persists across a session-type change (it's stamped by
+    THIS job, not derived from the plan's content) while a name-based check
+    would incorrectly flag every legitimate restructure as ambiguous.
+    """
     if not date_events:
         return None, None
+
     if len(date_events) == 1:
-        return date_events[0], None
-    # More than one event already exists on this date. If exactly one of
-    # them already has the exact name we're about to write, that's an
-    # unambiguous match (e.g. a re-run after a partial previous write).
+        e = date_events[0]
+        if e.get("external_id") == expected_tag:
+            return e, None
+        return None, (
+            f"UNTAGGED: the one event on this date (id {e.get('id')}, "
+            f"name {e.get('name')!r}) does not carry this job's identity tag "
+            f"({expected_tag!r} expected, got {e.get('external_id')!r}) -- "
+            f"not touched. Either a manually-added entry, or a pre-2026-09-17 "
+            f"survivor from before tagging existed (run the one-time backfill "
+            f"if the latter -- see scripts/backfill_sync_tags.py)."
+        )
+
+    # More than one event already exists on this date. Prefer the identity
+    # tag as the authoritative signal; fall back to exact-name match only
+    # for untagged events (defense in depth for the pre-backfill period).
+    tagged = [e for e in date_events if e.get("external_id") == expected_tag]
+    if len(tagged) == 1:
+        others = len(date_events) - 1
+        return tagged[0], (
+            f"{others} OTHER unmatched event(s) also exist on this date "
+            f"(ids: {[e['id'] for e in date_events if e is not tagged[0]]}) -- "
+            f"left untouched, not auto-deleted. Investigate manually."
+        )
+    if len(tagged) > 1:
+        return None, (
+            f"AMBIGUOUS: {len(tagged)} events on this date already carry this "
+            f"job's identity tag {expected_tag!r} -- should never happen, "
+            f"investigate manually (ids: {[e['id'] for e in tagged]})."
+        )
+
     exact = [e for e in date_events if e.get("name") == target_name]
     if len(exact) == 1:
         others = len(date_events) - 1
         return exact[0], (
             f"{others} OTHER unmatched event(s) also exist on this date "
-            f"(ids: {[e['id'] for e in date_events if e is not exact[0]]}) -- "
+            f"(ids: {[e['id'] for e in date_events if e is not exact[0]]}); "
+            f"matched by NAME not identity tag (untagged, pre-backfill?) -- "
             f"left untouched, not auto-deleted. Investigate manually."
         )
     # Genuinely ambiguous -- do not guess.
     return None, (
-        f"AMBIGUOUS: {len(date_events)} events exist on this date and none "
-        f"(or more than one) matches the target name exactly "
+        f"AMBIGUOUS: {len(date_events)} events exist on this date, none "
+        f"carries this job's identity tag, and none (or more than one) "
+        f"matches the target name exactly "
         f"(ids: {[e['id'] for e in date_events]}) -- skipped, not written."
     )
 
@@ -355,30 +417,68 @@ def build_dsl(row):
     return "\n".join(lines), assumption_note
 
 
+# [Marco/Rune-directed live probe, 2026-09-17] intervals.icu's step-DSL
+# parser was empirically tested against 5 constructs via real BQ-row ->
+# sync -> intervals.icu round trips (inject, run the live sync, inspect
+# workout_doc.steps, revert): a bare "Nx" repeat header with no dash-lines
+# nearby (SAFE, stays inert prose), the same bare header followed by
+# already-neutralised "\u2022" bullets (SAFE, confirms bullets can't be
+# consumed as steps by a stray header), an asterisk-prefixed line
+# ("* 12m Z4 HR" -- INJECTED a real 4th step, hr_zone 4, 720s), a
+# plus-prefixed line ("+ 12m Z4 HR" -- INJECTED, identical shape), and a
+# numbered-list line ("1. 12m Z4 HR" -- INJECTED, identical shape). So the
+# parser accepts the standard CommonMark list markers (-, *, +, and a
+# leading digit+"."/")"), not just a literal hyphen -- Cyrus's live test only
+# covered "-"; this probe found the other three are equally live.
+STEP_TRIGGER_RE = re.compile(r'^([-*+]|\d+[.)])(\s)')
+
+
 def sanitize_prose(text):
-    """[CYRUS-IMPORTANT] intervals.icu parses the ENTIRE description field
-    into workout_doc.steps -- not just the DSL block we deliberately append.
-    A coach-authored line in BQ's free-text `description` that happens to
-    start with "-" would be read as an additional structured step and pushed
-    to the watch with an unintended HR/power target. None of the 28 current
-    interval rows trigger this (checked), and BQ is first-party, but there is
-    no guard against a future authoring change doing it by accident. Checked
-    the full intervals.icu event schema (captured live, multiple real GETs,
-    2026-09-17) for a separate non-parsed notes field -- there isn't one;
-    `description` is the only text field and it is always parsed. So: strip
-    the trigger character from any line that would otherwise be read as a
-    step, on EVERY event (not just interval rows -- the same field is parsed
-    for every session type, so an easy/rest day's prose is just as exposed).
-    Meaning-preserving: a dash-led bullet still reads as a bullet, just with
-    a visually near-identical bullet character instead of a literal hyphen,
-    so it can never be mistaken for an intervals.icu step-DSL line."""
+    r"""[CYRUS-IMPORTANT, extended by the Rune/Marco-directed probe above]
+    intervals.icu parses the ENTIRE description field into workout_doc.steps
+    -- not just the DSL block we deliberately append. A coach-authored line
+    in BQ's free-text `description` that happens to start with a markdown
+    list marker (-, *, +, or "1.") would be read as an additional structured
+    step and pushed to the watch with an unintended HR/power target. None of
+    the 28 current interval rows trigger this (checked), and BQ is
+    first-party, but there is no guard against a future authoring change
+    doing it by accident. Checked the full intervals.icu event schema
+    (captured live, multiple real GETs, 2026-09-17) for a separate
+    non-parsed notes field -- there isn't one; `description` is the only
+    text field and it is always parsed. So: strip the trigger marker from
+    any line that would otherwise be read as a step, on EVERY event (not
+    just interval rows -- the same field is parsed for every session type,
+    so an easy/rest day's prose is just as exposed). Meaning-preserving: a
+    dash/star/plus-led bullet or numbered item still reads as a bullet, just
+    with a visually near-identical bullet character instead of the literal
+    trigger marker, so it can never be mistaken for an intervals.icu
+    step-DSL line.
+
+    [RUNE re-check fix, still in force] the trigger requires the marker to
+    be followed by whitespace (a capture group requiring whitespace), not just any character. Was
+    previously a bare `stripped.startswith("-")`, which corrupted legitimate
+    prose that has nothing to do with the step DSL: a negative temperature
+    ("-2C at start, dress warm" -> "-2" destroyed, silently flipping
+    below-zero to a bulleted 2C -- live-relevant, the MUT block has cold/wet
+    kit rehearsals and George runs near freezing in late May) and a markdown
+    "---" separator (already a convention in this codebase --
+    markdown_to_html() in cloud_function/main.py treats it specially) both
+    got wrongly mangled under the old bare-startswith check. Checked live:
+    none of the 287 training_plan rows currently contain either corruption
+    pattern (grepped for ^-\d and ^-{2,} across every description, 0 hits),
+    so nothing already written to intervals.icu needed retroactive repair --
+    this was and remains a forward-looking fix. Every genuine bullet/DSL
+    line in this codebase is written as marker+space, so anchoring on that
+    exact shape removes the false positives without weakening the injection
+    defence."""
     lines = (text or "").split("\n")
     out = []
     for line in lines:
         stripped = line.lstrip()
         indent = line[:len(line) - len(stripped)]
-        if stripped.startswith("-"):
-            stripped = "\u2022" + stripped[1:]  # bullet, not a step-triggering hyphen
+        m = STEP_TRIGGER_RE.match(stripped)
+        if m:
+            stripped = "\u2022" + stripped[len(m.group(1)):]
         out.append(indent + stripped)
     return "\n".join(out)
 
@@ -407,6 +507,7 @@ def build_target_event(row):
         "category": category,
         "name": row["session_name"],
         "description": desc,
+        "external_id": sync_tag(plan_date),
     }
     if icu_type:
         payload["type"] = icu_type
@@ -451,20 +552,46 @@ def training_plan_sync(request):
     window_start = datetime.now(ATHLETE_TZ).date()
     window_end = window_start + timedelta(days=WINDOW_DAYS)
 
-    bq_client = get_bq_client()
+    # [RUNE re-check, IMPORTANT] get_bq_client() and the seq=0 write used to
+    # sit OUTSIDE any try/except -- if either threw (credentials failure, an
+    # unexpected exception from insert_rows_json), it propagated unhandled:
+    # no alert email, no audit row, not even the seq=0 marker this job exists
+    # to write. Wrapped here with its own direct-alert fallback, since BQ
+    # itself may be the thing that's broken and can't be trusted to record
+    # its own failure.
+    try:
+        bq_client = get_bq_client()
+        # [RUNE-CRITICAL-2] write the IN_PROGRESS marker BEFORE any mutation.
+        # A run_id stuck at seq=0 with no seq=1 companion is itself the
+        # diagnostic signal of a crash mid-run.
+        seq0_ok = write_run_row(bq_client, {
+            "run_id": run_id, "started_at": started_at.isoformat(), "finished_at": None,
+            "status": "IN_PROGRESS", "dry_run": dry_run, "seq": 0,
+            "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
+            "rows_checked": None, "created": None, "updated": None, "skipped": None,
+            "errors": None, "error_message": None, "warnings": None, "orphans": None,
+            "anomalies": None,
+        })
+        if not seq0_ok:
+            # [RUNE re-check, IMPORTANT] treat the seq=0 write's return value
+            # symmetrically with the final write below -- a run that starts
+            # without its own crash-detection marker recorded must not
+            # proceed silently as if nothing were wrong.
+            raise RuntimeError("seq=0 IN_PROGRESS audit row failed to write -- see prior WARNING log line")
+    except Exception as init_err:
+        error_message = f"{init_err}\n{traceback.format_exc()}"
+        print(f"INIT FAILURE (before main try block, no audit row can be trusted): {error_message}")
+        send_alert_email(
+            "FAILED during initialization (no reliable audit row for this run)",
+            f"training-plan-sync run {run_id} failed before or during the seq=0 audit write.\n"
+            f"dry_run={dry_run}\nwindow={window_start}..{window_end}\n\n{error_message}"
+        )
+        return (json.dumps({
+            "run_id": run_id, "status": "FAILURE",
+            "detail": "init failure -- see Cloud Logging / alert email, no audit row guaranteed",
+        }), 500)
 
-    # [RUNE-CRITICAL-2] write the IN_PROGRESS marker BEFORE any mutation.
-    # A run_id stuck at seq=0 with no seq=1 companion is itself the
-    # diagnostic signal of a crash mid-run.
-    write_run_row(bq_client, {
-        "run_id": run_id, "started_at": started_at.isoformat(), "finished_at": None,
-        "status": "IN_PROGRESS", "dry_run": dry_run, "seq": 0,
-        "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
-        "rows_checked": None, "created": None, "updated": None, "skipped": None,
-        "errors": None, "error_message": None, "warnings": None, "orphans": None,
-    })
-
-    created = updated = skipped = errors = 0
+    created = updated = skipped = errors = anomalies = 0
     warnings = []
     error_message = None
     processed_dates = set()
@@ -494,7 +621,7 @@ def training_plan_sync(request):
             try:
                 target, detail = build_target_event(row)
                 date_events = icu_by_date.get(plan_date, [])
-                existing, anomaly = resolve_existing_event(date_events, target["name"])
+                existing, anomaly = resolve_existing_event(date_events, target["name"], sync_tag(plan_date))
                 if anomaly:
                     warnings.append(f"{plan_date}: {anomaly}")
 
@@ -537,10 +664,9 @@ def training_plan_sync(request):
                     updated += 1
                 elif action == "SKIP":
                     skipped += 1
-                # ANOMALY counted in neither -- surfaced via warnings + audit action
+                elif action == "ANOMALY":
+                    anomalies += 1  # also surfaced via warnings + audit action
 
-                if detail and action != "ANOMALY":
-                    pass  # detail already carries assumption notes, written below
                 write_event_row(bq_client, {
                     "run_id": run_id, "logged_at": datetime.now(timezone.utc).isoformat(),
                     "plan_date": plan_date, "session_type": session_type,
@@ -590,9 +716,10 @@ def training_plan_sync(request):
         "run_id": run_id, "started_at": started_at.isoformat(), "finished_at": finished_at.isoformat(),
         "status": status, "dry_run": dry_run, "seq": 1,
         "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
-        "rows_checked": created + updated + skipped + errors,
+        "rows_checked": created + updated + skipped + errors + anomalies,
         "created": created, "updated": updated, "skipped": skipped, "errors": errors,
         "error_message": error_message, "warnings": warnings_text, "orphans": len(orphan_dates),
+        "anomalies": anomalies,
     }
 
     # [RUNE-5] the audit write is the one guarantee this job makes -- its own
