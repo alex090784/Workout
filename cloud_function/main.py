@@ -213,18 +213,16 @@ GARMIN_BIKE_TYPES = {"road_biking", "mountain_biking", "cycling", "gravel_cyclin
                       "track_cycling"}
 GARMIN_STRENGTH_TYPES = {"strength_training", "indoor_cardio", "fitness_equipment"}
 
-# session_type values that are prescribed as warm-up + work reps + recovery +
-# cool-down (confirmed against every row in training_plan on 2026-09-16: each
-# of these carries a "Warm up Xkm ... NxYmin ... Cool down Xkm" description and
-# a "Course on watch" structured workout). Whole-activity average HR on these
-# is meaningless -- it blends four different intensities into one number.
-# 'long_run' can ALSO contain a race-effort segment (see e.g. 2026-09-13,
-# "Race-Effort Segment") but is NOT included here: it's one continuous run
-# with an embedded effort block, not a rep/recovery structure, and its
-# whole-activity average remains a fair (if blunt) signal for a long day.
-# There is no 'intervals' session_type in the plan data -- don't add one
-# speculatively; if the plan vocabulary changes, update this set to match.
-INTERVAL_SESSION_TYPES = {"vo2max", "threshold", "hill_repeats", "sharpener"}
+# INTERVAL_SESSION_TYPES and _parse_session_structure() now live in
+# session_parser.py (canonical: ~/Projects/garmin/shared/session_parser.py,
+# copied byte-for-byte into this directory by scripts/sync_shared_parser.sh
+# before every deploy) -- training-plan-sync needs the exact same parsing
+# logic to build intervals.icu's workout DSL, and two copies of a free-text
+# parser drifting apart was flagged as the single most common failure mode
+# in this project's history. See session_parser.py's module docstring for
+# the full reasoning. Do NOT redefine either symbol here -- edit the
+# canonical file, run the sync script, redeploy both functions.
+from session_parser import INTERVAL_SESSION_TYPES, _parse_session_structure  # noqa: E402
 
 # Session types excluded from fade-based verdict downgrade (Aria's ruling via
 # Marco, 2026-09-16): sharpener reps are very short/sharp with full recovery
@@ -626,37 +624,9 @@ def get_total_weeks():
 # This is the false-criticism mirror of the false-praise bug fixed in
 # August: judging a structured session by a single aggregate is wrong in
 # both directions.
-
-def _parse_session_structure(description):
-    """Pull (warmup_km, cooldown_km, rep_count, rep_minutes) out of the plan's
-    free-text description. Every INTERVAL_SESSION_TYPES row seen so far
-    follows 'Warm up Xkm. ... NxYmin ... Cool down Xkm.' (or 'Nx hill reps,
-    ~Ymin climb'). Any field this can't find comes back None -- callers must
-    treat that as "unknown", never assume a default.
-
-    `warmup_mentioned` / `cooldown_mentioned` (Rune IMPORTANT, 2026-09-16):
-    whether the literal phrase appears in the text AT ALL, independent of
-    whether a distance could be parsed from it. This distinguishes "no
-    warm-up/cool-down in this session" (nothing to strip, fine) from
-    "warm-up/cool-down exists but we don't know its length" (something IS
-    sitting in the lap data that must not silently stay in `interior` just
-    because the distance-based strip couldn't fire) -- confirmed live on 14
-    of 28 current interval-type training_plan rows: text reads "Cool down."
-    with no distance, e.g. "3x8min @ Z4 with 2min jog recovery. Cool down.
-    Raising threshold ahead of the specific block."
-    """
-    d = description or ""
-    wu = re.search(r'[Ww]arm[- ]?up\s+([\d.]+)\s*km', d)
-    cd = re.search(r'[Cc]ool[- ]?down\s+([\d.]+)\s*km', d)
-    rep = re.search(r'(\d+)\s*x\.?\s*(?:hill reps,?\s*~?)?(\d+)\s*min', d)
-    return {
-        "warmup_km":   float(wu.group(1)) if wu else None,
-        "cooldown_km": float(cd.group(1)) if cd else None,
-        "rep_count":   int(rep.group(1)) if rep else None,
-        "rep_minutes": int(rep.group(2)) if rep else None,
-        "warmup_mentioned":   bool(re.search(r'[Ww]arm[- ]?up', d)),
-        "cooldown_mentioned": bool(re.search(r'[Cc]ool[- ]?down', d)),
-    }
+#
+# _parse_session_structure() itself is imported from session_parser.py (see
+# note above INTERVAL_SESSION_TYPES) -- not redefined here.
 
 
 def fetch_activity_laps(garmin_client, activity_id):
