@@ -432,6 +432,24 @@ def build_dsl(row):
 # covered "-"; this probe found the other three are equally live.
 STEP_TRIGGER_RE = re.compile(r'^([-*+]|\d+[.)])(\s)')
 
+# [Rune Test 2, live-verified 2026-09-17] a bare hyphen immediately followed
+# by a duration-shaped token -- NO whitespace required -- is ALSO live: real
+# round trip confirmed "-12m Z4 HR" (no space) injects a spurious 4th step,
+# identical in shape to the whitespace-gated case. This is hyphen-specific:
+# the same no-space test on *, +, "1." and "1)" all came back inert (also
+# live-verified) -- only "-" has this extra leniency, almost certainly
+# because intervals.icu's own DSL reuses "-" for numeric ranges elsewhere
+# (e.g. "165-175" HR ranges, "103-108% LTHR"), so its tokenizer treats a
+# bare "-" as a possible numeric lead-in even without whitespace.
+# Critically, "-2C at start, dress warm" was ALSO live-tested and confirmed
+# INERT -- "2C" isn't a recognised duration unit, so intervals.icu's parser
+# itself only completes the step if a real unit follows. This regex mirrors
+# that exact distinction (unit-gated, not just digit-gated) specifically so
+# genuine negative-number prose is not swept up again the way the original
+# bare `startswith("-")` bug did -- a broader "hyphen then any digit"
+# trigger would have reintroduced that exact corruption.
+NO_SPACE_HYPHEN_DURATION_RE = re.compile(r'^-\d+(\.\d+)?(h|m|s|km|mtr|mi)\b')
+
 
 def sanitize_prose(text):
     r"""[CYRUS-IMPORTANT, extended by the Rune/Marco-directed probe above]
@@ -479,6 +497,8 @@ def sanitize_prose(text):
         m = STEP_TRIGGER_RE.match(stripped)
         if m:
             stripped = "\u2022" + stripped[len(m.group(1)):]
+        elif NO_SPACE_HYPHEN_DURATION_RE.match(stripped):
+            stripped = "\u2022" + stripped[1:]
         out.append(indent + stripped)
     return "\n".join(out)
 
@@ -751,7 +771,7 @@ def training_plan_sync(request):
             f"Status: {status}\ndry_run: {dry_run}\n"
             f"Window: {window_start} -> {window_end}\n"
             f"created={created} updated={updated} skipped={skipped} errors={errors} "
-            f"orphans={len(orphan_dates)}\n\n"
+            f"anomalies={anomalies} orphans={len(orphan_dates)}\n\n"
             f"error_message:\n{error_message or '(none)'}\n\n"
             f"warnings:\n{warnings_text or '(none)'}"
         )
